@@ -7,21 +7,42 @@ import type {
   UpdateClientParams,
 } from './types.js';
 
+/**
+ * Sanaei (3x-ui) Panel API Client
+ *
+ * Supports two authentication methods:
+ * 1. API Key (Bearer token) — recommended for v3.x+
+ *    Generate in panel: Settings → Security → API Token
+ *    Sent as: Authorization: Bearer <token>
+ *
+ * 2. Session login (legacy fallback)
+ *    POST /login with {username, password} → session cookie
+ */
 export class SanaeiClient {
   private baseUrl: string;
+  private apiKey: string;
   private username: string;
   private password: string;
   private cookie: string | null = null;
   private lastLogin: number = 0;
   private readonly SESSION_TTL = 30 * 60 * 1000; // 30 minutes
 
-  constructor(url?: string, username?: string, password?: string) {
+  constructor(url?: string, apiKey?: string, username?: string, password?: string) {
     this.baseUrl = (url || config.PANEL_URL).replace(/\/$/, '');
+    this.apiKey = apiKey || config.PANEL_API_KEY;
     this.username = username || config.PANEL_USERNAME;
     this.password = password || config.PANEL_PASSWORD;
   }
 
+  /** Whether we're using API key auth (no session management needed) */
+  private get useApiKey(): boolean {
+    return this.apiKey.length > 0;
+  }
+
+  // === Authentication ===
+
   private async ensureSession(): Promise<void> {
+    if (this.useApiKey) return; // API key auth doesn't need sessions
     const now = Date.now();
     if (this.cookie && now - this.lastLogin < this.SESSION_TTL) {
       return;
@@ -32,8 +53,8 @@ export class SanaeiClient {
   private async login(): Promise<void> {
     const res = await fetch(`${this.baseUrl}/login`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
         username: this.username,
         password: this.password,
       }),
@@ -54,6 +75,14 @@ export class SanaeiClient {
     }
   }
 
+  /** Build auth headers based on the configured method */
+  private getAuthHeaders(): Record<string, string> {
+    if (this.useApiKey) {
+      return { Authorization: `Bearer ${this.apiKey}` };
+    }
+    return { Cookie: this.cookie || '' };
+  }
+
   private async request<T>(
     path: string,
     options: RequestInit = {},
@@ -64,16 +93,34 @@ export class SanaeiClient {
       ...options,
       headers: {
         'Content-Type': 'application/json',
-        Cookie: this.cookie || '',
+        ...this.getAuthHeaders(),
         ...options.headers,
       },
     });
 
-    if (res.status === 401 || res.status === 302) {
-      // Session expired, re-login and retry
+    // Handle auth failure
+    if (res.status === 401 || res.status === 403 || res.status === 302) {
+      if (this.useApiKey) {
+        throw new Error(
+          `Sanaei API auth failed (401/403). Check your PANEL_API_KEY in Settings → Security → API Token.`,
+        );
+      }
+      // Session expired, re-login and retry once
       this.cookie = null;
       await this.login();
-      return this.request<T>(path, options);
+      const retryRes = await fetch(`${this.baseUrl}${path}`, {
+        ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          ...this.getAuthHeaders(),
+          ...options.headers,
+        },
+      });
+      const retryData = (await retryRes.json()) as SanaeiApiResponse<T>;
+      if (!retryData.success) {
+        throw new Error(`Sanaei API error [${path}]: ${retryData.msg || 'unknown'}`);
+      }
+      return retryData;
     }
 
     const data = (await res.json()) as SanaeiApiResponse<T>;
@@ -228,11 +275,14 @@ export class SanaeiClient {
 
   async testConnection(): Promise<{ success: boolean; message: string }> {
     try {
-      await this.login();
+      if (!this.useApiKey) {
+        await this.login();
+      }
       const inbounds = await this.getInbounds();
+      const authMethod = this.useApiKey ? 'API Key (Bearer)' : 'Session (login)';
       return {
         success: true,
-        message: `Connected successfully. Found ${inbounds.length} inbounds.`,
+        message: `Connected via ${authMethod}. Found ${inbounds.length} inbounds.`,
       };
     } catch (error) {
       return {

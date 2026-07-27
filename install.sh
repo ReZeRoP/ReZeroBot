@@ -47,8 +47,16 @@ echo ""
 info "Sanaei Panel Configuration"
 read -rp "  Panel URL (e.g. http://1.2.3.4:2053): " PANEL_URL
 [[ -z "$PANEL_URL" ]] && error "Panel URL is required"
-read -rp "  Panel Username: " PANEL_USERNAME
-read -rp "  Panel Password: " PANEL_PASSWORD
+read -rp "  Panel API Key (Settings → Security → API Token): " PANEL_API_KEY
+if [[ -z "$PANEL_API_KEY" ]]; then
+  warn "No API Key provided. Falling back to username/password login."
+  read -rp "  Panel Username: " PANEL_USERNAME
+  read -rp "  Panel Password: " PANEL_PASSWORD
+else
+  PANEL_USERNAME=""
+  PANEL_PASSWORD=""
+  log "Using API Key authentication (recommended)"
+fi
 
 echo ""
 info "Payment Gateways (optional, press Enter to skip)"
@@ -133,6 +141,7 @@ ADMIN_PORT=8081
 WEBHOOK_PATH=/webhook
 
 PANEL_URL=${PANEL_URL}
+PANEL_API_KEY=${PANEL_API_KEY}
 PANEL_USERNAME=${PANEL_USERNAME}
 PANEL_PASSWORD=${PANEL_PASSWORD}
 

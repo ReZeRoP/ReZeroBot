@@ -239,8 +239,9 @@ docker compose up -d --build
 | `DATABASE_URL` | PostgreSQL connection string | — |
 | `REDIS_URL` | Redis connection string | — |
 | `PANEL_URL` | Sanaei panel address | — |
-| `PANEL_USERNAME` | Panel login username | — |
-| `PANEL_PASSWORD` | Panel login password | — |
+| `PANEL_API_KEY` | API token (Settings → Security → API Token) | — |
+| `PANEL_USERNAME` | Panel login username (fallback if no API key) | — |
+| `PANEL_PASSWORD` | Panel login password (fallback if no API key) | — |
 | `JWT_SECRET` | Secret for JWT token signing | — |
 | `MINIAPP_URL` | Mini App URL for Telegram | — |
 | `CHANNEL_ID` | Mandatory join channel (@username) | — |
@@ -253,6 +254,37 @@ docker compose up -d --build
 | `ZARINPAL_MERCHANT_ID` | Zarinpal gateway merchant ID | — |
 | `AQAYEPARDAKHT_PIN` | Aqayepardakht gateway PIN | — |
 | `CARD_NUMBER` | Card number for manual payments | — |
+
+## Panel Connection (Sanaei 3x-ui v3.x)
+
+The bot connects to your 3x-ui panel via its REST API. Two authentication methods are supported:
+
+### Method 1: API Key (Recommended)
+
+1. Open your 3x-ui panel web interface
+2. Go to **Settings → Security → API Token**
+3. Click **Generate** to create a new API token
+4. Copy the token and set it in `.env`:
+
+```env
+PANEL_URL=http://your-panel-ip:2053
+PANEL_API_KEY=your_generated_api_token_here
+```
+
+The bot will send `Authorization: Bearer <token>` on every API request. No login step needed.
+
+### Method 2: Username/Password (Legacy Fallback)
+
+If `PANEL_API_KEY` is empty, the bot falls back to session-based login:
+
+```env
+PANEL_URL=http://your-panel-ip:2053
+PANEL_API_KEY=
+PANEL_USERNAME=admin
+PANEL_PASSWORD=your_password
+```
+
+The bot will POST to `/login` and manage session cookies automatically.
 
 ## Payment Gateways
 

@@ -14,6 +14,7 @@ const envSchema = z.object({
   WEBHOOK_PATH: z.string().default('/webhook'),
 
   PANEL_URL: z.string().default(''),
+  PANEL_API_KEY: z.string().default(''),
   PANEL_USERNAME: z.string().default('admin'),
   PANEL_PASSWORD: z.string().default('admin'),
 
