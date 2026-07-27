@@ -55,6 +55,9 @@ export const en: Record<TranslationKey, string> = {
   service_status_active: '✅ Active',
   service_status_expired: '❌ Expired',
   service_status_pending: '⏳ Pending',
+  service_renewed: '✅ Your service has been renewed successfully!',
+  service_expired: '⚠️ Your service {service} has expired. Visit the shop to renew.',
+  expiry_reminder: '⏰ Your service {service} expires in {days} day(s). Renew now to avoid interruption.',
 
   // Wallet
   wallet_balance: '💰 Your wallet balance: {balance}',

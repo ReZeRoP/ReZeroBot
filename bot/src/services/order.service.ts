@@ -1,9 +1,9 @@
-import { eq, and, desc } from 'drizzle-orm';
+import { eq, and, desc, sql, gte } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { orders, products, users, walletTransactions } from '../db/schema.js';
 import { sanaeiClient } from '../panels/sanaei/client.js';
 import { nanoid } from 'nanoid';
-import type { Language } from '../i18n/index.js';
+import { config } from '../config.js';
 
 export interface CreateOrderParams {
   userId: number;
@@ -24,9 +24,10 @@ export async function createOrder(params: CreateOrderParams) {
   const subId = nanoid(16);
   const now = Date.now();
   const expiryTime = params.isTrial
-    ? now + 24 * 60 * 60 * 1000
+    ? now + config.TRIAL_DAYS * 24 * 60 * 60 * 1000
     : now + product.durationDays * 24 * 60 * 60 * 1000;
-  const totalGB = product.volumeGb > 0 ? product.volumeGb * 1024 * 1024 * 1024 : 0;
+  const volumeGb = params.isTrial ? config.TRIAL_VOLUME_GB : product.volumeGb;
+  const totalGB = volumeGb > 0 ? volumeGb * 1024 * 1024 * 1024 : 0;
 
   // Create client on Sanaei panel
   const inboundId = product.inboundId || 1;
@@ -48,8 +49,9 @@ export async function createOrder(params: CreateOrderParams) {
       productId: params.productId,
       status: 'active',
       usernameOnPanel: email,
+      panelUserId: inboundId,
       subLink,
-      volumeGb: product.volumeGb,
+      volumeGb,
       durationDays: product.durationDays,
       expireAt: new Date(expiryTime),
       isTrial: params.isTrial || false,
@@ -91,20 +93,18 @@ export async function renewOrder(orderId: number, days: number) {
 
   // Update on panel
   if (order.usernameOnPanel) {
-    const client = await sanaeiClient.getClientByEmail(
-      order.panelUserId || 1,
-      order.usernameOnPanel,
-    );
-    if (client) {
-      await sanaeiClient.updateClient({
-        inboundId: order.panelUserId || 1,
-        clientId: client.id,
-        email: order.usernameOnPanel,
-        totalGB: client.totalGB,
-        expiryTime: newExpiry,
-        enable: true,
-      });
-    }
+    const inboundId = order.panelUserId || 1;
+    const client = await sanaeiClient.getClientByEmail(inboundId, order.usernameOnPanel);
+    if (!client) throw new Error(`Client ${order.usernameOnPanel} not found on panel inbound ${inboundId}`);
+    const clientId = sanaeiClient.getClientIdentifier(client);
+    await sanaeiClient.updateClient({
+      inboundId,
+      clientId,
+      email: order.usernameOnPanel,
+      totalGB: client.totalGB as number,
+      expiryTime: newExpiry,
+      enable: true,
+    });
   }
 
   const [updated] = await db
@@ -124,20 +124,18 @@ export async function addVolumeToOrder(orderId: number, additionalGb: number) {
   const totalBytes = newVolume > 0 ? newVolume * 1024 * 1024 * 1024 : 0;
 
   if (order.usernameOnPanel) {
-    const client = await sanaeiClient.getClientByEmail(
-      order.panelUserId || 1,
-      order.usernameOnPanel,
-    );
-    if (client) {
-      await sanaeiClient.updateClient({
-        inboundId: order.panelUserId || 1,
-        clientId: client.id,
-        email: order.usernameOnPanel,
-        totalGB: totalBytes,
-        expiryTime: client.expiryTime,
-        enable: true,
-      });
-    }
+    const inboundId = order.panelUserId || 1;
+    const client = await sanaeiClient.getClientByEmail(inboundId, order.usernameOnPanel);
+    if (!client) throw new Error(`Client ${order.usernameOnPanel} not found on panel inbound ${inboundId}`);
+    const clientId = sanaeiClient.getClientIdentifier(client);
+    await sanaeiClient.updateClient({
+      inboundId,
+      clientId,
+      email: order.usernameOnPanel,
+      totalGB: totalBytes,
+      expiryTime: client.expiryTime as number,
+      enable: true,
+    });
   }
 
   const [updated] = await db
@@ -153,25 +151,26 @@ export async function purchaseWithWallet(
   userId: number,
   productId: number,
   finalPrice: number,
-  lang: Language,
 ) {
-  const user = await db.query.users.findFirst({ where: eq(users.id, userId) });
-  if (!user) throw new Error('User not found');
-  if (user.balance < finalPrice) throw new Error('Insufficient balance');
+  // Atomic transaction: deduct balance + create order together
+  return db.transaction(async (tx) => {
+    // Atomically deduct with guard
+    const [updated] = await tx
+      .update(users)
+      .set({ balance: sql`${users.balance} - ${finalPrice}`, updatedAt: new Date() })
+      .where(and(eq(users.id, userId), gte(users.balance, finalPrice)))
+      .returning();
 
-  // Deduct balance
-  await db
-    .update(users)
-    .set({ balance: user.balance - finalPrice, updatedAt: new Date() })
-    .where(eq(users.id, userId));
+    if (!updated) throw new Error('Insufficient balance');
 
-  await db.insert(walletTransactions).values({
-    userId,
-    amount: -finalPrice,
-    type: 'purchase',
-    description: `Purchase product #${productId}`,
+    await tx.insert(walletTransactions).values({
+      userId,
+      amount: -finalPrice,
+      type: 'purchase',
+      description: `Purchase product #${productId}`,
+    });
+
+    // Create order (panel call + DB insert)
+    return createOrder({ userId, productId, finalPrice });
   });
-
-  // Create order
-  return createOrder({ userId, productId, finalPrice });
 }

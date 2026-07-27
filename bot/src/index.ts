@@ -5,9 +5,14 @@ import { createBot } from './bot/index.js';
 import { webhookCallback } from 'grammy';
 import { createApiRouter } from './api/index.js';
 import { startCronJobs } from './cron/index.js';
+import { runMigrations } from './db/index.js';
 
 async function main() {
   console.log('🚀 Starting Sanaei VPN Bot...');
+
+  // Run database migrations
+  await runMigrations();
+  console.log('🗄️ Database ready');
 
   // Create Express app
   const app = express();
@@ -38,6 +43,12 @@ async function main() {
   // Mount API routes
   const apiRouter = createApiRouter();
   app.use('/api', apiRouter);
+
+  // Global error handler (must be after routes)
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    console.error('[API Error]', err.message || err);
+    res.status(err.status || 500).json({ error: err.message || 'Internal server error' });
+  });
 
   // Health check
   app.get('/health', (_req, res) => {

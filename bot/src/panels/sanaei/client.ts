@@ -16,10 +16,11 @@ import type {
  *    Sent as: Authorization: Bearer <token>
  *
  * 2. Session login (legacy fallback)
- *    POST /login with {username, password} → session cookie
+ *    POST /login with form-urlencoded {username, password} → session cookie
  */
 export class SanaeiClient {
   private baseUrl: string;
+  private panelOrigin: string;
   private apiKey: string;
   private username: string;
   private password: string;
@@ -29,6 +30,7 @@ export class SanaeiClient {
 
   constructor(url?: string, apiKey?: string, username?: string, password?: string) {
     this.baseUrl = (url || config.PANEL_URL).replace(/\/$/, '');
+    this.panelOrigin = new URL(this.baseUrl).origin;
     this.apiKey = apiKey || config.PANEL_API_KEY;
     this.username = username || config.PANEL_USERNAME;
     this.password = password || config.PANEL_PASSWORD;
@@ -42,7 +44,7 @@ export class SanaeiClient {
   // === Authentication ===
 
   private async ensureSession(): Promise<void> {
-    if (this.useApiKey) return; // API key auth doesn't need sessions
+    if (this.useApiKey) return;
     const now = Date.now();
     if (this.cookie && now - this.lastLogin < this.SESSION_TTL) {
       return;
@@ -53,26 +55,34 @@ export class SanaeiClient {
   private async login(): Promise<void> {
     const res = await fetch(`${this.baseUrl}/login`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
         username: this.username,
         password: this.password,
       }),
       redirect: 'manual',
     });
 
+    // Parse and validate BEFORE caching the cookie
+    let data: SanaeiApiResponse;
+    try {
+      data = (await res.json()) as SanaeiApiResponse;
+    } catch {
+      throw new Error('Sanaei panel login failed: invalid response from panel');
+    }
+
+    if (!data.success) {
+      throw new Error(`Sanaei panel login failed: ${data.msg || 'unknown error'}`);
+    }
+
     const setCookie = res.headers.get('set-cookie');
     if (!setCookie) {
       throw new Error('Sanaei panel login failed: no session cookie received');
     }
 
+    // Only cache after successful validation
     this.cookie = setCookie.split(';')[0];
     this.lastLogin = Date.now();
-
-    const data = (await res.json()) as SanaeiApiResponse;
-    if (!data.success) {
-      throw new Error(`Sanaei panel login failed: ${data.msg || 'unknown error'}`);
-    }
   }
 
   /** Build auth headers based on the configured method */
@@ -91,6 +101,7 @@ export class SanaeiClient {
 
     const res = await fetch(`${this.baseUrl}${path}`, {
       ...options,
+      redirect: 'manual',
       headers: {
         'Content-Type': 'application/json',
         ...this.getAuthHeaders(),
@@ -99,10 +110,10 @@ export class SanaeiClient {
     });
 
     // Handle auth failure
-    if (res.status === 401 || res.status === 403 || res.status === 302) {
+    if (res.status === 401 || res.status === 302) {
       if (this.useApiKey) {
         throw new Error(
-          `Sanaei API auth failed (401/403). Check your PANEL_API_KEY in Settings → Security → API Token.`,
+          `Sanaei API auth failed. Check your PANEL_API_KEY (Settings → Security → API Token).`,
         );
       }
       // Session expired, re-login and retry once
@@ -110,17 +121,29 @@ export class SanaeiClient {
       await this.login();
       const retryRes = await fetch(`${this.baseUrl}${path}`, {
         ...options,
+        redirect: 'manual',
         headers: {
           'Content-Type': 'application/json',
           ...this.getAuthHeaders(),
           ...options.headers,
         },
       });
+      if (!retryRes.ok) {
+        throw new Error(`Sanaei API retry failed [${path}]: HTTP ${retryRes.status}`);
+      }
       const retryData = (await retryRes.json()) as SanaeiApiResponse<T>;
       if (!retryData.success) {
         throw new Error(`Sanaei API error [${path}]: ${retryData.msg || 'unknown'}`);
       }
       return retryData;
+    }
+
+    if (res.status === 403) {
+      throw new Error(`Sanaei API forbidden [${path}]: check panel permissions or API key`);
+    }
+
+    if (!res.ok) {
+      throw new Error(`Sanaei API HTTP error [${path}]: ${res.status}`);
     }
 
     const data = (await res.json()) as SanaeiApiResponse<T>;
@@ -142,15 +165,22 @@ export class SanaeiClient {
     return res.obj || null;
   }
 
+  // === Server Operations ===
+
+  async getServerStatus(): Promise<Record<string, unknown>> {
+    const res = await this.request<Record<string, unknown>>('/panel/api/server/status');
+    return res.obj || {};
+  }
+
   // === Client Operations ===
 
-  async addClient(params: CreateClientParams): Promise<void> {
+  async addClient(params: CreateClientParams): Promise<Record<string, unknown>> {
     const inbound = await this.getInbound(params.inboundId);
     if (!inbound) {
       throw new Error(`Inbound ${params.inboundId} not found`);
     }
 
-    const settings = JSON.parse(inbound.settings);
+    const inboundSettings = JSON.parse(inbound.settings);
     const newClient: Record<string, unknown> = {
       email: params.email,
       enable: params.enable ?? true,
@@ -171,19 +201,19 @@ export class SanaeiClient {
       newClient.flow = params.flow || '';
     } else if (inbound.protocol === 'shadowsocks') {
       newClient.password = this.generateUUID();
-      newClient.method = settings.method || 'aes-256-gcm';
+      newClient.method = inboundSettings.method || 'aes-256-gcm';
     }
 
-    settings.clients = settings.clients || [];
-    settings.clients.push(newClient);
-
+    // 3x-ui addClient APPENDS clients from settings — send ONLY the new client
     await this.request(`/panel/api/inbounds/addClient`, {
       method: 'POST',
       body: JSON.stringify({
         id: params.inboundId,
-        settings: JSON.stringify(settings),
+        settings: JSON.stringify({ clients: [newClient] }),
       }),
     });
+
+    return newClient;
   }
 
   async updateClient(params: UpdateClientParams): Promise<void> {
@@ -192,17 +222,19 @@ export class SanaeiClient {
       throw new Error(`Inbound ${params.inboundId} not found`);
     }
 
-    const settings = JSON.parse(inbound.settings);
-    const clientIndex = settings.clients?.findIndex(
-      (c: { id?: string; email?: string }) => c.id === params.clientId || c.email === params.email,
+    const inboundSettings = JSON.parse(inbound.settings);
+    const existingClient = inboundSettings.clients?.find(
+      (c: { id?: string; password?: string; email?: string }) =>
+        c.id === params.clientId || c.password === params.clientId || c.email === params.email,
     );
 
-    if (clientIndex === -1 || clientIndex === undefined) {
+    if (!existingClient) {
       throw new Error(`Client ${params.email} not found in inbound ${params.inboundId}`);
     }
 
-    settings.clients[clientIndex] = {
-      ...settings.clients[clientIndex],
+    // Build the updated client object
+    const updatedClient = {
+      ...existingClient,
       email: params.email,
       totalGB: params.totalGB,
       expiryTime: params.expiryTime,
@@ -210,11 +242,13 @@ export class SanaeiClient {
       ...(params.flow !== undefined && { flow: params.flow }),
     };
 
+    // 3x-ui updateClient/{uuid} replaces the matched client with clients[0] from body
+    // Send ONLY the updated client
     await this.request(`/panel/api/inbounds/updateClient/${params.clientId}`, {
       method: 'POST',
       body: JSON.stringify({
         id: params.inboundId,
-        settings: JSON.stringify(settings),
+        settings: JSON.stringify({ clients: [updatedClient] }),
       }),
     });
   }
@@ -238,7 +272,7 @@ export class SanaeiClient {
     return res.obj || null;
   }
 
-  async getClientByEmail(inboundId: number, email: string) {
+  async getClientByEmail(inboundId: number, email: string): Promise<Record<string, unknown> | null> {
     const inbound = await this.getInbound(inboundId);
     if (!inbound) return null;
 
@@ -246,10 +280,17 @@ export class SanaeiClient {
     return settings.clients?.find((c: { email: string }) => c.email === email) || null;
   }
 
+  /** Get the panel identifier for a client (id for vless/vmess, password for trojan/ss) */
+  getClientIdentifier(client: Record<string, unknown>): string {
+    return (client.id as string) || (client.password as string) || '';
+  }
+
   // === Subscription ===
 
   getSubscriptionUrl(subId: string): string {
-    return `${this.baseUrl}/sub/${subId}`;
+    // Subscriptions are served from the panel origin + sub path (not the web base path)
+    const subPath = config.PANEL_SUB_PATH || '/sub';
+    return `${this.panelOrigin}${subPath}/${subId}`;
   }
 
   // === Helpers ===

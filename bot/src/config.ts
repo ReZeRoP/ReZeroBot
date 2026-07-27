@@ -1,6 +1,10 @@
 import 'dotenv/config';
 import { z } from 'zod';
 
+/** Parse env boolean correctly: "false" → false, "true" → true */
+const boolFlag = (defaultVal: 'true' | 'false') =>
+  z.enum(['true', 'false', '1', '0', '']).default(defaultVal).transform((v) => v === 'true' || v === '1');
+
 const envSchema = z.object({
   BOT_TOKEN: z.string().min(1),
   BOT_USERNAME: z.string().default(''),
@@ -17,6 +21,7 @@ const envSchema = z.object({
   PANEL_API_KEY: z.string().default(''),
   PANEL_USERNAME: z.string().default('admin'),
   PANEL_PASSWORD: z.string().default('admin'),
+  PANEL_SUB_PATH: z.string().default('/sub'),
 
   ZARINPAL_MERCHANT_ID: z.string().default(''),
   AQAYEPARDAKHT_PIN: z.string().default(''),
@@ -28,19 +33,19 @@ const envSchema = z.object({
   CARD_NUMBER: z.string().default(''),
   CARD_HOLDER: z.string().default(''),
 
-  JWT_SECRET: z.string().default('change_this_secret'),
+  JWT_SECRET: z.string().min(8, 'JWT_SECRET must be at least 8 characters'),
   MINIAPP_URL: z.string().default(''),
 
   CHANNEL_ID: z.string().default(''),
-  CHANNEL_ENABLED: z.coerce.boolean().default(false),
+  CHANNEL_ENABLED: boolFlag('false'),
 
-  TRIAL_ENABLED: z.coerce.boolean().default(true),
+  TRIAL_ENABLED: boolFlag('true'),
   TRIAL_DAYS: z.coerce.number().default(1),
   TRIAL_VOLUME_GB: z.coerce.number().default(1),
-  REFERRAL_ENABLED: z.coerce.boolean().default(true),
+  REFERRAL_ENABLED: boolFlag('true'),
   REFERRAL_REWARD: z.coerce.number().default(10000),
-  LOTTERY_ENABLED: z.coerce.boolean().default(true),
-  PHONE_VERIFY_ENABLED: z.coerce.boolean().default(false),
+  LOTTERY_ENABLED: boolFlag('true'),
+  PHONE_VERIFY_ENABLED: boolFlag('false'),
 });
 
 const parsed = envSchema.safeParse(process.env);

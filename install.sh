@@ -53,8 +53,8 @@ if [[ -z "$PANEL_API_KEY" ]]; then
   read -rp "  Panel Username: " PANEL_USERNAME
   read -rp "  Panel Password: " PANEL_PASSWORD
 else
-  PANEL_USERNAME=""
-  PANEL_PASSWORD=""
+  PANEL_USERNAME="admin"
+  PANEL_PASSWORD="admin"
   log "Using API Key authentication (recommended)"
 fi
 

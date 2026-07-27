@@ -1,5 +1,6 @@
 import { InlineKeyboard, Keyboard } from 'grammy';
 import { t, type Language } from '../i18n/index.js';
+import { config } from '../config.js';
 
 export function mainMenuKeyboard(lang: Language): Keyboard {
   return new Keyboard()
@@ -97,9 +98,12 @@ export function supportKeyboard(lang: Language): InlineKeyboard {
     .text(t(lang, 'back_to_menu'), 'menu:main');
 }
 
-export function channelCheckKeyboard(channelId: string, lang: Language): InlineKeyboard {
+export function channelCheckKeyboard(lang: Language): InlineKeyboard {
+  const channelUrl = config.CHANNEL_ID.startsWith('@')
+    ? `https://t.me/${config.CHANNEL_ID.slice(1)}`
+    : config.CHANNEL_ID;
   return new InlineKeyboard()
-    .text(t(lang, 'channel_join'), `url:https://t.me/${channelId.replace('@', '')}`)
+    .url(t(lang, 'channel_join'), channelUrl)
     .row()
     .text(t(lang, 'channel_check'), 'check:channel');
 }

@@ -53,6 +53,9 @@ export const fa = {
   service_status_active: '✅ فعال',
   service_status_expired: '❌ منقضی',
   service_status_pending: '⏳ در انتظار',
+  service_renewed: '✅ سرویس شما با موفقیت تمدید شد!',
+  service_expired: '⚠️ سرویس {service} شما منقضی شد. برای تمدید به فروشگاه مراجعه کنید.',
+  expiry_reminder: '⏰ سرویس {service} شما تا {days} روز دیگر منقضی می‌شود. برای تمدید اقدام کنید.',
 
   // Wallet
   wallet_balance: '💰 موجودی کیف پول شما: {balance} تومان',

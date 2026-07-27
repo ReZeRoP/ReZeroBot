@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { db } from '../db/index.js';
 import { users, referrals, walletTransactions } from '../db/schema.js';
 import { nanoid } from 'nanoid';
@@ -29,7 +29,7 @@ export async function getOrCreateUser(info: TelegramUserInfo, refCode?: string) 
       })
       .where(eq(users.id, existing.id));
 
-    return existing;
+    return { user: existing, isNew: false };
   }
 
   // Create new user
@@ -45,19 +45,28 @@ export async function getOrCreateUser(info: TelegramUserInfo, refCode?: string) 
     }
   }
 
-  const [newUser] = await db
-    .insert(users)
-    .values({
-      telegramId: info.telegramId,
-      username: info.username,
-      firstName: info.firstName,
-      lastName: info.lastName,
-      refCode: newRefCode,
-      referredBy,
-      balance: 0,
-      language: 'fa',
-    })
-    .returning();
+  let newUser;
+  try {
+    [newUser] = await db
+      .insert(users)
+      .values({
+        telegramId: info.telegramId,
+        username: info.username,
+        firstName: info.firstName,
+        lastName: info.lastName,
+        refCode: newRefCode,
+        referredBy,
+        balance: 0,
+        language: 'fa',
+      })
+      .returning();
+  } catch {
+    // Concurrent insert — user already exists, fetch and return
+    const raced = await db.query.users.findFirst({
+      where: eq(users.telegramId, info.telegramId),
+    });
+    return { user: raced!, isNew: false };
+  }
 
   // Process referral reward
   if (referredBy && config.REFERRAL_ENABLED) {
@@ -67,10 +76,10 @@ export async function getOrCreateUser(info: TelegramUserInfo, refCode?: string) 
       rewardAmount: config.REFERRAL_REWARD,
     });
 
-    // Credit referrer
+    // Credit referrer atomically (increment, not overwrite)
     await db
       .update(users)
-      .set({ balance: config.REFERRAL_REWARD })
+      .set({ balance: sql`${users.balance} + ${config.REFERRAL_REWARD}`, updatedAt: new Date() })
       .where(eq(users.id, referredBy));
 
     await db.insert(walletTransactions).values({
@@ -81,7 +90,7 @@ export async function getOrCreateUser(info: TelegramUserInfo, refCode?: string) 
     });
   }
 
-  return newUser;
+  return { user: newUser, isNew: true };
 }
 
 export async function getUserByTelegramId(telegramId: number) {
