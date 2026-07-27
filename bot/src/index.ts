@@ -4,6 +4,7 @@ import { config } from './config.js';
 import { createBot } from './bot/index.js';
 import { webhookCallback } from 'grammy';
 import { createApiRouter } from './api/index.js';
+import { createAdminRouter } from './api/admin.js';
 import { startCronJobs } from './cron/index.js';
 import { runMigrations } from './db/index.js';
 
@@ -43,6 +44,10 @@ async function main() {
   // Mount API routes
   const apiRouter = createApiRouter();
   app.use('/api', apiRouter);
+
+  // Mount Admin API routes
+  const adminRouter = createAdminRouter();
+  app.use('/api/admin', adminRouter);
 
   // Global error handler (must be after routes)
   app.use((err: any, _req: any, res: any, _next: any) => {
