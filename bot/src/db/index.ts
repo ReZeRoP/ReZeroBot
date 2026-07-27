@@ -17,9 +17,11 @@ export { schema };
 
 export async function runMigrations() {
   const migrationsFolder = resolve(process.cwd(), 'drizzle');
-  if (existsSync(migrationsFolder)) {
+  const journalPath = resolve(migrationsFolder, 'meta/_journal.json');
+  if (existsSync(journalPath)) {
     await migrate(db, { migrationsFolder });
+    console.log('[DB] Migrations applied successfully');
   } else {
-    console.log('[DB] No migrations folder found. Run "pnpm db:generate" first, or use "pnpm db:push" for development.');
+    console.log('[DB] No migrations found. Tables must be created via "drizzle-kit push" or generated migrations.');
   }
 }
