@@ -19,9 +19,6 @@ COPY bot/ ./bot/
 # Build
 RUN pnpm --filter bot build
 
-# Generate database migrations (drizzle-kit is available in dev deps)
-RUN cd bot && npx drizzle-kit generate
-
 # ---- Production Stage ----
 FROM node:20-alpine AS runner
 
