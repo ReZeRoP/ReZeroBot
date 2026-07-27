@@ -219,8 +219,13 @@ else
 fi
 
 systemctl enable caddy
-systemctl restart caddy
-log "Caddy configured for ${DOMAIN}"
+if systemctl restart caddy; then
+  log "Caddy configured for ${DOMAIN}"
+else
+  warn "Caddy failed to start. Check: journalctl -xeu caddy.service"
+  warn "Make sure DNS for ${DOMAIN} points to this server and ports 80/443 are free."
+  warn "You can fix and restart later: systemctl restart caddy"
+fi
 
 # --- Build and start containers ---
 info "Building and starting containers..."
