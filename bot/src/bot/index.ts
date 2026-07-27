@@ -62,9 +62,9 @@ export function createBot() {
     const { user, isNew } = await getOrCreateUser(
       {
         telegramId,
-        username: ctx.from.username,
-        firstName: ctx.from.first_name,
-        lastName: ctx.from.last_name,
+        username: ctx.from!.username,
+        firstName: ctx.from!.first_name,
+        lastName: ctx.from!.last_name,
       },
       refCode,
     );
@@ -80,7 +80,7 @@ export function createBot() {
       return ctx.reply(t('fa', 'welcome'), { reply_markup: languageKeyboard() });
     }
 
-    await ctx.reply(t(lang, 'welcomeBack', { name: ctx.from.first_name || 'User' }), {
+    await ctx.reply(t(lang, 'welcomeBack', { name: ctx.from!.first_name || 'User' }), {
       reply_markup: mainMenuKeyboard(lang),
     });
   });
@@ -395,7 +395,9 @@ export function createBot() {
       if (!config.ZARINPAL_MERCHANT_ID) return ctx.reply(t(lang, 'error_generic'));
 
       try {
-        const result = await zarinpalRequest(finalPrice, `Product #${prodId}`);
+        const result = await zarinpalRequest({ amount: finalPrice, userId: user.id, description: `Product #${prodId}` });
+        if (!result.success || !result.paymentUrl) return ctx.reply(t(lang, 'error_generic'));
+
         const [payment] = await db.insert(payments).values({
           userId: user.id,
           gateway: 'zarinpal',
@@ -425,18 +427,20 @@ export function createBot() {
 
       try {
         const { nowpaymentsRequest } = await import('../payments/index.js');
-        const result = await nowpaymentsRequest(product.price, `Product #${prodId}`);
+        const result = await nowpaymentsRequest({ amount: product.price, userId: user.id, description: `Product #${prodId}` });
+        if (!result.success || !result.paymentUrl) return ctx.reply(t(lang, 'error_generic'));
+
         await db.insert(payments).values({
           userId: user.id,
           gateway: 'nowpayments',
           amount: product.price,
           status: 'pending',
-          refId: String(result.paymentId),
+          refId: result.refId,
           description: `Product #${prodId}`,
         });
 
         return ctx.reply(t(lang, 'payment_online_link'), {
-          reply_markup: { inline_keyboard: [[{ text: t(lang, 'payment_pay_button'), url: result.payUrl }]] },
+          reply_markup: { inline_keyboard: [[{ text: t(lang, 'payment_pay_button'), url: result.paymentUrl }]] },
         });
       } catch {
         return ctx.reply(t(lang, 'error_generic'));
@@ -609,7 +613,7 @@ export function createBot() {
   });
 
   // === Admin approval commands ===
-  bot.command(/approve_(\d+)/, async (ctx) => {
+  bot.hears(/\/approve_(\d+)/, async (ctx) => {
     if (!adminIds.includes(ctx.from?.id || 0)) return;
     const paymentId = parseInt(ctx.match[1]);
     const payment = await db.query.payments.findFirst({ where: eq(payments.id, paymentId) });
@@ -634,7 +638,7 @@ export function createBot() {
     return ctx.reply(`✅ Payment #${paymentId} approved.`);
   });
 
-  bot.command(/reject_(\d+)/, async (ctx) => {
+  bot.hears(/\/reject_(\d+)/, async (ctx) => {
     if (!adminIds.includes(ctx.from?.id || 0)) return;
     const paymentId = parseInt(ctx.match[1]);
     const payment = await db.query.payments.findFirst({ where: eq(payments.id, paymentId) });

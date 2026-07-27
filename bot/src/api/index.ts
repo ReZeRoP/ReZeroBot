@@ -6,7 +6,7 @@ import { getUserByTelegramId } from '../services/user.service.js';
 import { getActiveCategories, getProductsByCategory, getProductById } from '../services/product.service.js';
 import { getUserOrders, getOrderById, createOrder, renewOrder, addVolumeToOrder } from '../services/order.service.js';
 import { db } from '../db/index.js';
-import { walletTransactions, users, discountCodes, trials, payments, orders } from '../db/schema.js';
+import { walletTransactions, users, discountCodes, trials, payments } from '../db/schema.js';
 import { eq, desc, sql, and, gte } from 'drizzle-orm';
 
 /** Async handler wrapper for Express 4 — catches rejections and forwards to error middleware */

@@ -3,10 +3,10 @@ import jwt from 'jsonwebtoken';
 import { config, adminIds } from '../config.js';
 import { db } from '../db/index.js';
 import {
-  users, products, categories, orders, payments, panels, inbounds,
-  discountCodes, giftCodes, lotteries, lotteryEntries, settings, messages, trials, walletTransactions,
+  users, products, categories, orders, payments, panels,
+  discountCodes, giftCodes, settings, messages, walletTransactions,
 } from '../db/schema.js';
-import { eq, desc, sql, and, like, count } from 'drizzle-orm';
+import { eq, desc, sql, count } from 'drizzle-orm';
 
 const ah = (fn: (req: any, res: any, next: any) => Promise<any>) =>
   (req: Request, res: Response, next: NextFunction) =>
@@ -34,11 +34,7 @@ export function createAdminRouter(): Router {
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
 
-    const admin = await db.query.admins.findFirst({
-      where: eq(users.telegramId, 0), // placeholder — use admins table
-    });
-
-    // Simple auth: check against ADMIN_IDS + a shared secret (settings table)
+    // Simple auth: check against a shared secret (settings table)
     const adminSetting = await db.query.settings.findFirst({ where: eq(settings.key, 'admin_password') });
     const storedPass = adminSetting?.value || 'admin';
 
@@ -75,9 +71,7 @@ export function createAdminRouter(): Router {
     const page = parseInt(req.query.page || '1');
     const limit = 20;
     const offset = (page - 1) * limit;
-    const search = req.query.search as string;
 
-    let query = db.select().from(users);
     const userList = await db.select().from(users)
       .orderBy(desc(users.createdAt))
       .limit(limit)
@@ -245,7 +239,7 @@ export function createAdminRouter(): Router {
   router.get('/settings', ah(async (_req: any, res: any) => {
     const allSettings = await db.select().from(settings);
     const settingsMap: Record<string, string> = {};
-    for (const s of allSettings) settingsMap[s.key] = s.value;
+    for (const s of allSettings) settingsMap[s.key] = s.value || '';
     res.json(settingsMap);
   }));
 
