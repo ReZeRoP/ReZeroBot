@@ -20,8 +20,5 @@
   "engines": {
     "node": ">=20.0.0",
     "pnpm": ">=9.0.0"
-  },
-  "dependencies": {
-    "docker": "^1.0.0"
   }
 }

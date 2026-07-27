@@ -17,9 +17,38 @@ warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
 error() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
 info()  { echo -e "${BLUE}[i]${NC} $1"; }
 
+PROJECT_DIR="/opt/sanaei-vpn-bot"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # --- Pre-flight checks ---
 if [[ $EUID -ne 0 ]]; then
   error "This script must be run as root (sudo ./install.sh)"
+fi
+
+# --- Update mode: if .env already exists, skip prompts ---
+if [[ -f "$PROJECT_DIR/.env" && "${1:-}" == "--update" ]]; then
+  info "Update mode detected — re-deploying with existing configuration..."
+  
+  # Backup .env
+  cp "$PROJECT_DIR/.env" /tmp/.env.backup
+  
+  # Copy fresh source (including dotfiles)
+  info "Copying updated source files..."
+  cp -r "$SCRIPT_DIR"/. "$PROJECT_DIR/"
+  
+  # Restore .env
+  cp /tmp/.env.backup "$PROJECT_DIR/.env"
+  rm -f /tmp/.env.backup
+  
+  # Rebuild
+  cd "$PROJECT_DIR"
+  info "Rebuilding containers (no cache)..."
+  docker compose build --no-cache
+  docker compose up -d
+  
+  log "Update complete!"
+  docker compose logs --tail=10
+  exit 0
 fi
 
 info "Sanaei VPN Bot Installer"
@@ -45,8 +74,10 @@ DB_PASS=${DB_PASS:-$(openssl rand -hex 16)}
 
 echo ""
 info "Sanaei Panel Configuration"
-read -rp "  Panel URL (e.g. http://1.2.3.4:2053): " PANEL_URL
+read -rp "  Panel URL (e.g. https://1.2.3.4:2053/basePath): " PANEL_URL
 [[ -z "$PANEL_URL" ]] && error "Panel URL is required"
+# Strip trailing slash
+PANEL_URL="${PANEL_URL%/}"
 read -rp "  Panel API Key (Settings → Security → API Token): " PANEL_API_KEY
 if [[ -z "$PANEL_API_KEY" ]]; then
   warn "No API Key provided. Falling back to username/password login."
@@ -57,6 +88,8 @@ else
   PANEL_PASSWORD="admin"
   log "Using API Key authentication (recommended)"
 fi
+read -rp "  Subscription Path [/sub]: " PANEL_SUB_PATH
+PANEL_SUB_PATH=${PANEL_SUB_PATH:-/sub}
 
 echo ""
 info "Payment Gateways (optional, press Enter to skip)"
@@ -106,16 +139,21 @@ else
 fi
 
 # --- Create project directory ---
-PROJECT_DIR="/opt/sanaei-vpn-bot"
 mkdir -p "$PROJECT_DIR"
 log "Project directory: $PROJECT_DIR"
 
-# --- Copy project files ---
+# --- Copy project files (including dotfiles) ---
 info "Copying project files..."
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cp -r "$SCRIPT_DIR"/* "$PROJECT_DIR/" 2>/dev/null || true
-cp -r "$SCRIPT_DIR"/.env.example "$PROJECT_DIR/" 2>/dev/null || true
-cp -r "$SCRIPT_DIR"/.gitignore "$PROJECT_DIR/" 2>/dev/null || true
+cp -r "$SCRIPT_DIR"/. "$PROJECT_DIR/"
+
+# --- Initialize git repo for future updates ---
+if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree &>/dev/null; then
+  git -C "$PROJECT_DIR" init -q
+  git -C "$PROJECT_DIR" add -A
+  git -C "$PROJECT_DIR" -c user.name="installer" -c user.email="installer@local" commit -qm "Initial deploy $(date +%F)"
+  git -C "$PROJECT_DIR" remote add origin https://github.com/ReZeRoP/ReZeroBot.git 2>/dev/null || true
+  log "Git repository initialized (git pull available for future updates)"
+fi
 
 # --- Generate .env ---
 info "Generating .env configuration..."
@@ -144,6 +182,7 @@ PANEL_URL=${PANEL_URL}
 PANEL_API_KEY=${PANEL_API_KEY}
 PANEL_USERNAME=${PANEL_USERNAME}
 PANEL_PASSWORD=${PANEL_PASSWORD}
+PANEL_SUB_PATH=${PANEL_SUB_PATH}
 
 ZARINPAL_MERCHANT_ID=${ZARINPAL_MERCHANT_ID}
 AQAYEPARDAKHT_PIN=${AQAYEPARDAKHT_PIN}
@@ -228,10 +267,11 @@ else
 fi
 
 # --- Build and start containers ---
-info "Building and starting containers..."
+info "Building containers (this may take a few minutes)..."
 cd "$PROJECT_DIR"
 docker compose down --remove-orphans 2>/dev/null || true
-docker compose up -d --build
+docker compose build --no-cache
+docker compose up -d
 
 log "Containers started"
 
@@ -246,12 +286,13 @@ for i in $(seq 1 30); do
 done
 log "Database is ready"
 
-# --- Run migrations ---
-info "Running database migrations..."
+# --- Push DB schema ---
+info "Pushing database schema..."
 docker exec sanaei-bot node -e "
-  const { drizzle } = require('drizzle-orm/postgres-js');
-  console.log('Migrations will run on first bot start');
-" 2>/dev/null || warn "Migrations will auto-run on bot startup"
+  import('drizzle-kit').then(() => {}).catch(() => {});
+" 2>/dev/null || true
+# The bot auto-runs migrations on startup; for first deploy use db:push
+warn "If this is a fresh install, run: docker exec sanaei-bot npx drizzle-kit push"
 
 # --- Systemd service for auto-restart ---
 info "Creating systemd service..."
@@ -297,6 +338,7 @@ echo "  Commands:"
 echo "    docker compose logs -f     # View logs"
 echo "    docker compose restart     # Restart all"
 echo "    docker compose down        # Stop all"
+echo "    ./install.sh --update      # Update to latest code"
 echo ""
 echo -e "${YELLOW}  ⚠ Save your DB password: ${DB_PASS}${NC}"
 echo "═══════════════════════════════════════════"

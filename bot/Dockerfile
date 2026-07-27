@@ -34,6 +34,7 @@ COPY bot/package.json ./bot/
 RUN pnpm install --filter bot --prod --frozen-lockfile || pnpm install --filter bot --prod
 
 COPY --from=builder /app/bot/dist ./bot/dist
+COPY --from=builder /app/bot/drizzle ./bot/drizzle
 
 WORKDIR /app/bot
 
