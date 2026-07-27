@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: sanaei-bot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-sanaei_bot}
+      POSTGRES_USER: ${DB_USER:-sanaei}
+      POSTGRES_PASSWORD: ${DB_PASS:-sanaei_secret}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-sanaei}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: sanaei-bot-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  bot:
+    build:
+      context: .
+      dockerfile: bot/Dockerfile
+    container_name: sanaei-bot
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    ports:
+      - "${BOT_PORT:-3000}:3000"
+
+  miniapp:
+    build:
+      context: .
+      dockerfile: miniapp/Dockerfile
+    container_name: sanaei-miniapp
+    restart: unless-stopped
+    ports:
+      - "${MINIAPP_PORT:-8080}:80"
+
+  admin:
+    build:
+      context: .
+      dockerfile: admin/Dockerfile
+    container_name: sanaei-admin
+    restart: unless-stopped
+    ports:
+      - "${ADMIN_PORT:-8081}:80"
+
+volumes:
+  postgres_data:
+  redis_data:

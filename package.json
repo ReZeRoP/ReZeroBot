@@ -1,0 +1,27 @@
+{
+  "name": "sanaei-vpn-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Telegram VPN bot for Sanaei (3x-ui) panel with Mini App",
+  "scripts": {
+    "dev:bot": "pnpm --filter bot dev",
+    "dev:miniapp": "pnpm --filter miniapp dev",
+    "dev:admin": "pnpm --filter admin dev",
+    "build:bot": "pnpm --filter bot build",
+    "build:miniapp": "pnpm --filter miniapp build",
+    "build:admin": "pnpm --filter admin build",
+    "build": "pnpm -r build",
+    "db:generate": "pnpm --filter bot db:generate",
+    "db:migrate": "pnpm --filter bot db:migrate",
+    "db:push": "pnpm --filter bot db:push",
+    "lint": "eslint . --ext .ts,.tsx",
+    "format": "prettier --write ."
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "dependencies": {
+    "docker": "^1.0.0"
+  }
+}
