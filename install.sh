@@ -143,8 +143,12 @@ mkdir -p "$PROJECT_DIR"
 log "Project directory: $PROJECT_DIR"
 
 # --- Copy project files (including dotfiles) ---
-info "Copying project files..."
-cp -r "$SCRIPT_DIR"/. "$PROJECT_DIR/"
+if [[ "$(realpath "$SCRIPT_DIR")" != "$(realpath "$PROJECT_DIR")" ]]; then
+  info "Copying project files..."
+  cp -r "$SCRIPT_DIR"/. "$PROJECT_DIR/"
+else
+  log "Already running from project directory — skipping copy"
+fi
 
 # --- Initialize git repo for future updates ---
 if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree &>/dev/null; then
