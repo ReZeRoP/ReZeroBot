@@ -34,7 +34,11 @@ if [[ -f "$PROJECT_DIR/.env" && "${1:-}" == "--update" ]]; then
   
   # Copy fresh source (including dotfiles)
   info "Copying updated source files..."
-  cp -r "$SCRIPT_DIR"/. "$PROJECT_DIR/"
+  if [[ "$(realpath "$SCRIPT_DIR")" != "$(realpath "$PROJECT_DIR")" ]]; then
+    cp -r "$SCRIPT_DIR"/. "$PROJECT_DIR/"
+  else
+    log "Already running from project directory — skipping copy"
+  fi
   
   # Restore .env
   cp /tmp/.env.backup "$PROJECT_DIR/.env"
@@ -290,13 +294,9 @@ for i in $(seq 1 30); do
 done
 log "Database is ready"
 
-# --- Push DB schema ---
-info "Pushing database schema..."
-docker exec sanaei-bot node -e "
-  import('drizzle-kit').then(() => {}).catch(() => {});
-" 2>/dev/null || true
-# The bot auto-runs migrations on startup; for first deploy use db:push
-warn "If this is a fresh install, run: docker exec sanaei-bot npx drizzle-kit push"
+# --- Push DB schema (auto-handled by migrations on bot startup) ---
+info "Database schema will be applied automatically on bot startup via migrations."
+log "Database initialization complete"
 
 # --- Systemd service for auto-restart ---
 info "Creating systemd service..."

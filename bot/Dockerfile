@@ -19,6 +19,9 @@ COPY bot/ ./bot/
 # Build
 RUN pnpm --filter bot build
 
+# Generate database migrations (drizzle-kit is available in dev deps)
+RUN cd bot && npx drizzle-kit generate
+
 # ---- Production Stage ----
 FROM node:20-alpine AS runner
 
@@ -35,8 +38,6 @@ RUN pnpm install --filter bot --prod --frozen-lockfile || pnpm install --filter 
 
 COPY --from=builder /app/bot/dist ./bot/dist
 COPY --from=builder /app/bot/drizzle ./bot/drizzle
-COPY --from=builder /app/bot/drizzle.config.ts ./bot/drizzle.config.ts
-COPY --from=builder /app/bot/src/db/schema.ts ./bot/src/db/schema.ts
 
 WORKDIR /app/bot
 

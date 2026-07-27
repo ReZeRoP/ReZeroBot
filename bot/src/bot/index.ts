@@ -632,7 +632,8 @@ export function createBot() {
 
     // Notify user
     try {
-      await ctx.api.sendMessage(payment.userId, t('fa', 'payment_approved'));
+      const payUser = await db.query.users.findFirst({ where: eq(users.id, payment.userId) });
+      if (payUser) await ctx.api.sendMessage(payUser.telegramId, t('fa', 'payment_approved'));
     } catch { /* user may not have started bot */ }
 
     return ctx.reply(`✅ Payment #${paymentId} approved.`);
@@ -647,7 +648,8 @@ export function createBot() {
     await db.update(payments).set({ status: 'rejected' }).where(eq(payments.id, paymentId));
 
     try {
-      await ctx.api.sendMessage(payment.userId, t('fa', 'payment_rejected'));
+      const payUser = await db.query.users.findFirst({ where: eq(users.id, payment.userId) });
+      if (payUser) await ctx.api.sendMessage(payUser.telegramId, t('fa', 'payment_rejected'));
     } catch { /* */ }
 
     return ctx.reply(`❌ Payment #${paymentId} rejected.`);

@@ -30,8 +30,6 @@ async function main() {
     // Webhook mode
     app.use(config.WEBHOOK_PATH, webhookCallback(bot, 'express'));
     console.log(`📡 Webhook mode: ${config.DOMAIN}${config.WEBHOOK_PATH}`);
-
-    await bot.api.setWebhook(`${config.DOMAIN}${config.WEBHOOK_PATH}`);
   } else {
     // Polling mode for development
     bot.start({
@@ -61,8 +59,17 @@ async function main() {
   });
 
   // Start server
-  app.listen(config.BOT_PORT, () => {
+  app.listen(config.BOT_PORT, async () => {
     console.log(`🌐 Server running on port ${config.BOT_PORT}`);
+    // Register webhook AFTER server is listening to avoid dropped updates
+    if (process.env.NODE_ENV === 'production') {
+      try {
+        await bot.api.setWebhook(`${config.DOMAIN}${config.WEBHOOK_PATH}`);
+        console.log(`📡 Webhook registered: ${config.DOMAIN}${config.WEBHOOK_PATH}`);
+      } catch (err) {
+        console.error('Failed to set webhook:', err);
+      }
+    }
   });
 
   // Start cron jobs
