@@ -21,7 +21,7 @@ import { getActiveCategories, getProductsByCategory, getProductById } from '../s
 import { getActiveOrders, purchaseWithWallet, getOrderById, createOrder } from '../services/order.service.js';
 import { formatPrice, formatVolume, formatDuration } from '../i18n/index.js';
 import { db } from '../db/index.js';
-import { payments, trials, discountCodes, users, walletTransactions } from '../db/schema.js';
+import { payments, trials, discountCodes, users, walletTransactions, products } from '../db/schema.js';
 import { eq, sql } from 'drizzle-orm';
 import { zarinpalRequest } from '../payments/index.js';
 
@@ -228,8 +228,6 @@ export function createBot() {
     if (!user) return ctx.answerCallbackQuery();
     const lang = user.language as Language;
     const data = ctx.callbackQuery.data;
-
-    await ctx.answerCallbackQuery();
 
     // Language selection
     if (data.startsWith('lang:')) {
@@ -471,7 +469,13 @@ export function createBot() {
           const { renewOrder } = await import('../services/order.service.js');
           await db.update(users).set({ balance: sql`${users.balance} - ${product.price}`, updatedAt: new Date() }).where(eq(users.id, user.id));
           await db.insert(walletTransactions).values({ userId: user.id, amount: -product.price, type: 'purchase', description: `Renew order #${orderId}` });
-          await renewOrder(orderId, product.durationDays);
+          try {
+            await renewOrder(orderId, product.durationDays);
+          } catch (renewErr) {
+            // Refund on renewal failure
+            await db.update(users).set({ balance: sql`${users.balance} + ${product.price}`, updatedAt: new Date() }).where(eq(users.id, user.id));
+            throw renewErr;
+          }
           return ctx.reply(t(lang, 'service_renewed'), { reply_markup: mainMenuKeyboard(lang) });
         } catch {
           return ctx.reply(t(lang, 'error_generic'));
@@ -540,9 +544,13 @@ export function createBot() {
       if (existingTrial) return ctx.reply(t(lang, 'trial_used'));
 
       try {
+        // Find the first active product for trial
+        const trialProduct = await db.query.products.findFirst({ where: eq(products.isActive, true) });
+        if (!trialProduct) return ctx.reply(t(lang, 'error_generic'));
+
         const result = await createOrder({
           userId: user.id,
-          productId: 1,
+          productId: trialProduct.id,
           isTrial: true,
           finalPrice: 0,
         });
@@ -619,22 +627,46 @@ export function createBot() {
     const payment = await db.query.payments.findFirst({ where: eq(payments.id, paymentId) });
     if (!payment || payment.status !== 'pending') return ctx.reply('Payment not found or already processed.');
 
-    await db.update(payments).set({ status: 'confirmed' }).where(eq(payments.id, paymentId));
+    await db.update(payments).set({ status: 'confirmed', paidAt: new Date() }).where(eq(payments.id, paymentId));
 
-    // Credit wallet
-    await db.update(users).set({ balance: sql`${users.balance} + ${payment.amount}`, updatedAt: new Date() }).where(eq(users.id, payment.userId));
-    await db.insert(walletTransactions).values({
-      userId: payment.userId,
-      amount: payment.amount,
-      type: 'charge',
-      description: `Card payment #${paymentId} approved`,
-    });
+    const payUser = await db.query.users.findFirst({ where: eq(users.id, payment.userId) });
 
-    // Notify user
-    try {
-      const payUser = await db.query.users.findFirst({ where: eq(users.id, payment.userId) });
-      if (payUser) await ctx.api.sendMessage(payUser.telegramId, t('fa', 'payment_approved'));
-    } catch { /* user may not have started bot */ }
+    // Check if this is a product purchase or a wallet charge
+    const productMatch = payment.description?.match(/Product #(\d+)/);
+
+    if (productMatch) {
+      // Product purchase — create order and deliver config
+      const productId = parseInt(productMatch[1]);
+      try {
+        const result = await createOrder({
+          userId: payment.userId,
+          productId,
+          finalPrice: payment.amount,
+        });
+        // Notify user with config
+        if (payUser) {
+          await ctx.api.sendMessage(payUser.telegramId,
+            `${t('fa', 'payment_approved')}\n\n${result.subLink}`,
+          );
+        }
+      } catch (err) {
+        // If order creation fails, credit wallet as fallback
+        await db.update(users).set({ balance: sql`${users.balance} + ${payment.amount}`, updatedAt: new Date() }).where(eq(users.id, payment.userId));
+        if (payUser) await ctx.api.sendMessage(payUser.telegramId, t('fa', 'payment_approved'));
+      }
+    } else {
+      // Wallet charge — credit balance
+      await db.update(users).set({ balance: sql`${users.balance} + ${payment.amount}`, updatedAt: new Date() }).where(eq(users.id, payment.userId));
+      await db.insert(walletTransactions).values({
+        userId: payment.userId,
+        amount: payment.amount,
+        type: 'charge',
+        description: `Card payment #${paymentId} approved`,
+      });
+      if (payUser) {
+        try { await ctx.api.sendMessage(payUser.telegramId, t('fa', 'payment_approved')); } catch { /* */ }
+      }
+    }
 
     return ctx.reply(`✅ Payment #${paymentId} approved.`);
   });

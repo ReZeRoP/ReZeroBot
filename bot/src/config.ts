@@ -16,6 +16,7 @@ const envSchema = z.object({
 
   BOT_PORT: z.coerce.number().default(3000),
   WEBHOOK_PATH: z.string().default('/webhook'),
+  USE_POLLING: boolFlag('false'),
 
   PANEL_URL: z.string().default(''),
   PANEL_API_KEY: z.string().default(''),

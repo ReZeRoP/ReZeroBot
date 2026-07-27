@@ -110,16 +110,13 @@ export async function updateUserLanguage(userId: number, language: Language) {
 }
 
 export async function updateUserBalance(userId: number, amount: number) {
-  const user = await getUserById(userId);
-  if (!user) return null;
-
   const [updated] = await db
     .update(users)
-    .set({ balance: user.balance + amount, updatedAt: new Date() })
+    .set({ balance: sql`${users.balance} + ${amount}`, updatedAt: new Date() })
     .where(eq(users.id, userId))
     .returning();
 
-  return updated;
+  return updated || null;
 }
 
 export async function isUserBlocked(telegramId: number): Promise<boolean> {

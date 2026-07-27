@@ -25,13 +25,14 @@ async function main() {
 
   // Setup webhook or polling
   const isProduction = process.env.NODE_ENV === 'production';
+  const usePolling = config.USE_POLLING || !isProduction;
 
-  if (isProduction) {
-    // Webhook mode
+  if (!usePolling) {
+    // Webhook mode (requires HTTPS reverse proxy)
     app.use(config.WEBHOOK_PATH, webhookCallback(bot, 'express'));
     console.log(`📡 Webhook mode: ${config.DOMAIN}${config.WEBHOOK_PATH}`);
   } else {
-    // Polling mode for development
+    // Polling mode (no HTTPS needed)
     bot.start({
       onStart: (botInfo) => {
         console.log(`✅ Bot @${botInfo.username} started in polling mode`);
@@ -61,13 +62,21 @@ async function main() {
   // Start server
   app.listen(config.BOT_PORT, async () => {
     console.log(`🌐 Server running on port ${config.BOT_PORT}`);
-    // Register webhook AFTER server is listening to avoid dropped updates
-    if (process.env.NODE_ENV === 'production') {
+    // Register webhook AFTER server is listening (only in webhook mode)
+    if (!usePolling) {
       try {
         await bot.api.setWebhook(`${config.DOMAIN}${config.WEBHOOK_PATH}`);
         console.log(`📡 Webhook registered: ${config.DOMAIN}${config.WEBHOOK_PATH}`);
       } catch (err) {
-        console.error('Failed to set webhook:', err);
+        console.error('FATAL: Failed to set webhook. Bot will NOT receive updates.', err);
+        console.error('Fix: Set USE_POLLING=true in .env or ensure HTTPS is available.');
+        // Fallback to polling so the bot still works
+        console.log('⚠️ Falling back to polling mode...');
+        bot.start({
+          onStart: (botInfo) => {
+            console.log(`✅ Bot @${botInfo.username} started in polling fallback mode`);
+          },
+        });
       }
     }
   });

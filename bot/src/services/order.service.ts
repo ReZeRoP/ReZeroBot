@@ -152,25 +152,31 @@ export async function purchaseWithWallet(
   productId: number,
   finalPrice: number,
 ) {
-  // Atomic transaction: deduct balance + create order together
-  return db.transaction(async (tx) => {
-    // Atomically deduct with guard
-    const [updated] = await tx
-      .update(users)
-      .set({ balance: sql`${users.balance} - ${finalPrice}`, updatedAt: new Date() })
-      .where(and(eq(users.id, userId), gte(users.balance, finalPrice)))
-      .returning();
+  // 1. Atomic balance deduction (outside of long-running panel call)
+  const [updated] = await db
+    .update(users)
+    .set({ balance: sql`${users.balance} - ${finalPrice}`, updatedAt: new Date() })
+    .where(and(eq(users.id, userId), gte(users.balance, finalPrice)))
+    .returning();
 
-    if (!updated) throw new Error('Insufficient balance');
+  if (!updated) throw new Error('Insufficient balance');
 
-    await tx.insert(walletTransactions).values({
-      userId,
-      amount: -finalPrice,
-      type: 'purchase',
-      description: `Purchase product #${productId}`,
-    });
-
-    // Create order (panel call + DB insert)
-    return createOrder({ userId, productId, finalPrice });
+  // 2. Record wallet transaction
+  await db.insert(walletTransactions).values({
+    userId,
+    amount: -finalPrice,
+    type: 'purchase',
+    description: `Purchase product #${productId}`,
   });
+
+  // 3. Create order (makes HTTP call to panel)
+  try {
+    return await createOrder({ userId, productId, finalPrice });
+  } catch (err) {
+    // Refund balance on failure
+    await db.update(users)
+      .set({ balance: sql`${users.balance} + ${finalPrice}`, updatedAt: new Date() })
+      .where(eq(users.id, userId));
+    throw err;
+  }
 }
