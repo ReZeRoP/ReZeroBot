@@ -1,39 +1,65 @@
-import { Server, CheckCircle } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
+import { Server, CheckCircle, XCircle } from 'lucide-react';
+import { adminApi } from '../api/client';
 
 export function Panels() {
+  const { data: health, isLoading, refetch } = useQuery({
+    queryKey: ['panel-health'],
+    queryFn: adminApi.panelHealth,
+  });
+  const { data: panels } = useQuery({
+    queryKey: ['admin-panels'],
+    queryFn: adminApi.panels,
+  });
+
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-bold text-gray-900">پنل‌ها</h1>
-      <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
-        <div className="flex items-center justify-between mb-4">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-lg bg-blue-100 flex items-center justify-center">
-              <Server size={18} className="text-blue-600" />
-            </div>
-            <div>
-              <h3 className="font-bold text-gray-900">پنل اصلی (Sanaei)</h3>
-              <p className="text-xs text-gray-500">http://panel.example.com:2053</p>
-            </div>
-          </div>
-          <span className="flex items-center gap-1 px-2.5 py-1 bg-green-100 text-green-700 rounded-full text-xs">
-            <CheckCircle size={12} />
-            متصل
-          </span>
-        </div>
-        <div className="grid grid-cols-2 gap-4 mt-4">
-          <div className="p-3 bg-gray-50 rounded-lg">
-            <p className="text-xs text-gray-500">تعداد Inbound</p>
-            <p className="text-lg font-bold text-gray-900">۵</p>
-          </div>
-          <div className="p-3 bg-gray-50 rounded-lg">
-            <p className="text-xs text-gray-500">کلاینت‌های فعال</p>
-            <p className="text-lg font-bold text-gray-900">۸۹</p>
-          </div>
-        </div>
-        <button className="mt-4 w-full py-2.5 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700">
-          تست اتصال
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-bold text-gray-900">پنل‌ها</h1>
+        <button
+          onClick={() => refetch()}
+          className="px-3 py-1.5 text-sm bg-blue-50 text-blue-700 rounded-lg"
+        >
+          بررسی مجدد
         </button>
       </div>
+
+      <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="w-10 h-10 rounded-lg bg-blue-100 flex items-center justify-center">
+            <Server size={18} className="text-blue-600" />
+          </div>
+          <div>
+            <h3 className="font-bold text-gray-900">Sanaei / 3x-ui (از .env)</h3>
+            <p className="text-xs text-gray-500">اتصال از طریق PANEL_URL / PANEL_API_KEY</p>
+          </div>
+        </div>
+
+        {isLoading ? (
+          <p className="text-sm text-gray-500">در حال بررسی...</p>
+        ) : health?.success ? (
+          <div className="flex items-center gap-2 text-green-700 text-sm">
+            <CheckCircle size={16} />
+            {health.message}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2 text-red-700 text-sm">
+            <XCircle size={16} />
+            {health?.message || 'Connection failed'}
+          </div>
+        )}
+      </div>
+
+      {(panels || []).length > 0 && (
+        <div className="bg-white rounded-xl border p-5 space-y-2">
+          <h3 className="font-bold mb-2">پنل‌های ثبت‌شده در دیتابیس</h3>
+          {panels!.map((p: any) => (
+            <div key={p.id} className="text-sm text-gray-700 border-b py-2">
+              {p.name} — {p.url} ({p.status})
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

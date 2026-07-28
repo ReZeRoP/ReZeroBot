@@ -16,26 +16,25 @@ export function Layout() {
 
   return (
     <div className="flex flex-col min-h-screen bg-tg-secondary-bg">
-      {/* Main Content */}
       <main className="flex-1 pb-20 px-4 pt-4 overflow-y-auto">
         <Outlet />
       </main>
 
-      {/* Bottom Navigation */}
       <nav className="fixed bottom-0 left-0 right-0 bg-tg-bg border-t border-tg-section-separator safe-bottom z-50">
         <div className="flex items-center justify-around h-16 max-w-lg mx-auto">
           {navItems.map((item) => {
-            const isActive = location.pathname === item.path;
+            const isActive =
+              item.path === '/'
+                ? location.pathname === '/'
+                : location.pathname === item.path || location.pathname.startsWith(item.path + '/');
             const Icon = item.icon;
             return (
               <button
                 key={item.path}
                 onClick={() => navigate(item.path)}
                 className={clsx(
-                  'flex flex-col items-center gap-1 px-3 py-2 rounded-xl transition-all duration-200',
-                  isActive
-                    ? 'text-tg-button scale-105'
-                    : 'text-tg-hint hover:text-tg-text',
+                  'relative flex flex-col items-center gap-1 px-3 py-2 rounded-xl transition-all duration-200',
+                  isActive ? 'text-tg-button scale-105' : 'text-tg-hint hover:text-tg-text',
                 )}
               >
                 <Icon size={22} strokeWidth={isActive ? 2.5 : 1.8} />

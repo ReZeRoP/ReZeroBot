@@ -91,6 +91,7 @@ export const en: Record<TranslationKey, string> = {
 
   // Gift
   gift_enter: '🎁 Enter your gift code:',
+  gift_enter_btn: '🎁 Gift Code',
   gift_redeemed: '✅ Gift code redeemed! {amount} added to your wallet.',
   gift_invalid: '❌ Invalid or already used gift code.',
 

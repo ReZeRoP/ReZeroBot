@@ -22,13 +22,24 @@ export async function runMigrations() {
   const journalPath = resolve(migrationsFolder, 'meta/_journal.json');
 
   if (existsSync(journalPath)) {
-    // Normal drizzle migration path
-    await migrate(db, { migrationsFolder });
-    console.log('[DB] Migrations applied successfully');
+    try {
+      await migrate(db, { migrationsFolder });
+      console.log('[DB] Migrations applied successfully');
+    } catch (err) {
+      console.warn('[DB] Drizzle migrate failed, applying embedded schema patches:', err);
+      await db.execute(sql.raw(INIT_SCHEMA_SQL));
+      console.log('[DB] Embedded schema applied after migrate error');
+    }
   } else {
-    // Fallback: execute embedded schema SQL directly (compiled into dist/)
     console.log('[DB] No migration journal found — applying embedded schema...');
     await db.execute(sql.raw(INIT_SCHEMA_SQL));
     console.log('[DB] Schema initialized from embedded SQL');
+  }
+
+  // Always apply additive patches (new columns / indexes) idempotently
+  try {
+    await db.execute(sql.raw(INIT_SCHEMA_SQL));
+  } catch (err) {
+    console.warn('[DB] Post-migrate schema patch warning:', err);
   }
 }

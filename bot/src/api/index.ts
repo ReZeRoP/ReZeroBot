@@ -4,12 +4,24 @@ import crypto from 'crypto';
 import { config } from '../config.js';
 import { getUserByTelegramId } from '../services/user.service.js';
 import { getActiveCategories, getProductsByCategory, getProductById } from '../services/product.service.js';
-import { getUserOrders, getOrderById, createOrder, renewOrder, addVolumeToOrder } from '../services/order.service.js';
+import {
+  getUserOrders,
+  getOrderById,
+  purchaseWithWallet,
+  renewOrderWithWallet,
+  addVolumeWithWallet,
+  createOrder,
+} from '../services/order.service.js';
 import { db } from '../db/index.js';
-import { walletTransactions, users, discountCodes, trials, payments } from '../db/schema.js';
-import { eq, desc, sql, and, gte } from 'drizzle-orm';
+import { walletTransactions, discountCodes, trials, payments, products } from '../db/schema.js';
+import { eq, desc, and } from 'drizzle-orm';
+import { validateDiscountCode, priceAfterDiscount, redeemGiftCode } from '../services/discount.service.js';
+import {
+  createPendingPayment,
+  confirmAndFulfillPayment,
+} from '../services/payment.service.js';
+import { zarinpalRequest, zarinpalVerify } from '../payments/index.js';
 
-/** Async handler wrapper for Express 4 — catches rejections and forwards to error middleware */
 const ah = (fn: (req: any, res: any, next: any) => Promise<any>) =>
   (req: Request, res: Response, next: NextFunction) =>
     Promise.resolve(fn(req, res, next)).catch(next);
@@ -17,7 +29,6 @@ const ah = (fn: (req: any, res: any, next: any) => Promise<any>) =>
 export function createApiRouter(): Router {
   const router = Router();
 
-  // === Auth Middleware ===
   function authMiddleware(req: any, res: any, next: any) {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
@@ -40,15 +51,13 @@ export function createApiRouter(): Router {
     const hash = params.get('hash');
     if (!hash) return res.status(400).json({ error: 'Invalid initData' });
 
-    // Check auth_date freshness (reject older than 5 minutes)
     const authDate = params.get('auth_date');
     if (authDate) {
-      const age = Math.abs(Date.now() / 1000 - parseInt(authDate));
-      if (age > 300) return res.status(401).json({ error: 'initData expired' });
+      const age = Math.abs(Date.now() / 1000 - parseInt(authDate, 10));
+      if (age > 86400) return res.status(401).json({ error: 'initData expired' });
     }
 
     params.delete('hash');
-    // Sort by byte order (not locale)
     const dataCheckString = [...params.entries()]
       .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([k, v]) => `${k}=${v}`)
@@ -57,7 +66,6 @@ export function createApiRouter(): Router {
     const secretKey = crypto.createHmac('sha256', 'WebAppData').update(config.BOT_TOKEN).digest();
     const computedHash = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
 
-    // Timing-safe comparison
     const computedBuf = Buffer.from(computedHash, 'hex');
     const hashBuf = Buffer.from(hash, 'hex');
     if (computedBuf.length !== hashBuf.length || !crypto.timingSafeEqual(computedBuf, hashBuf)) {
@@ -70,15 +78,25 @@ export function createApiRouter(): Router {
     const tgUser = JSON.parse(userStr);
     const user = await getUserByTelegramId(tgUser.id);
     if (!user) return res.status(404).json({ error: 'User not found. Use /start first.' });
+    if (user.isBlocked) return res.status(403).json({ error: 'Account blocked' });
 
     const token = jwt.sign({ telegramId: tgUser.id, userId: user.id }, config.JWT_SECRET, {
       expiresIn: '7d',
     });
 
-    res.json({ token, user: { id: user.id, balance: user.balance, language: user.language } });
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        balance: user.balance,
+        language: user.language,
+        firstName: user.firstName,
+        username: user.username,
+      },
+    });
   }));
 
-  // === User Routes ===
+  // === Profile ===
   router.get('/v1/user/profile', authMiddleware, ah(async (req: any, res: any) => {
     const user = await getUserByTelegramId(req.telegramId);
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -110,14 +128,13 @@ export function createApiRouter(): Router {
   router.get('/v1/orders', authMiddleware, ah(async (req: any, res: any) => {
     const user = await getUserByTelegramId(req.telegramId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    const userOrders = await getUserOrders(user.id);
-    res.json(userOrders);
+    res.json(await getUserOrders(user.id));
   }));
 
   router.get('/v1/orders/:id', authMiddleware, ah(async (req: any, res: any) => {
     const user = await getUserByTelegramId(req.telegramId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    const order = await getOrderById(parseInt(req.params.id));
+    const order = await getOrderById(parseInt(req.params.id, 10));
     if (!order || order.userId !== user.id) return res.status(404).json({ error: 'Not found' });
     res.json(order);
   }));
@@ -128,75 +145,72 @@ export function createApiRouter(): Router {
 
     const { productId, discountCode } = req.body;
     const product = await getProductById(productId);
-    if (!product) return res.status(404).json({ error: 'Product not found' });
+    if (!product || !product.isActive) return res.status(404).json({ error: 'Product not found' });
 
     let finalPrice = product.price;
+    let validCode: string | undefined;
     if (discountCode) {
-      const code = await db.query.discountCodes.findFirst({
-        where: eq(discountCodes.code, discountCode),
-      });
-      if (code && code.isActive) {
-        // Validate expiry and usage
-        if (code.expireAt && code.expireAt < new Date()) {
-          return res.status(400).json({ error: 'Discount code expired' });
-        }
-        if (code.maxUses && code.usedCount >= code.maxUses) {
-          return res.status(400).json({ error: 'Discount code used up' });
-        }
-        const percent = Math.min(code.percent, 100);
-        finalPrice = Math.round(finalPrice * (1 - percent / 100));
-        // Increment usage atomically
-        await db.update(discountCodes).set({ usedCount: sql`${discountCodes.usedCount} + 1` }).where(eq(discountCodes.id, code.id));
-      }
+      const code = await validateDiscountCode(discountCode);
+      if (!code) return res.status(400).json({ error: 'Invalid discount code' });
+      finalPrice = priceAfterDiscount(product.price, code.percent);
+      validCode = code.code;
     }
 
     if (user.balance < finalPrice) {
       return res.status(400).json({ error: 'Insufficient balance' });
     }
 
-    // Atomic: deduct + create order
-    const result = await db.transaction(async (tx) => {
-      const [updated] = await tx
-        .update(users)
-        .set({ balance: sql`${users.balance} - ${finalPrice}`, updatedAt: new Date() })
-        .where(and(eq(users.id, user.id), gte(users.balance, finalPrice)))
-        .returning();
-
-      if (!updated) throw new Error('Insufficient balance');
-
-      await tx.insert(walletTransactions).values({
-        userId: user.id,
-        amount: -finalPrice,
-        type: 'purchase',
-        description: `Purchase product #${productId}`,
-      });
-
-      return createOrder({ userId: user.id, productId, finalPrice, discountCode });
-    });
-
-    res.json(result);
+    try {
+      const result = await purchaseWithWallet(user.id, productId, finalPrice, validCode);
+      if (validCode) {
+        const { sql } = await import('drizzle-orm');
+        await db
+          .update(discountCodes)
+          .set({ usedCount: sql`${discountCodes.usedCount} + 1` })
+          .where(eq(discountCodes.code, validCode));
+      }
+      res.json(result);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Purchase failed' });
+    }
   }));
 
   router.post('/v1/orders/:id/renew', authMiddleware, ah(async (req: any, res: any) => {
     const user = await getUserByTelegramId(req.telegramId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    const order = await getOrderById(parseInt(req.params.id));
+    const order = await getOrderById(parseInt(req.params.id, 10));
     if (!order || order.userId !== user.id) return res.status(404).json({ error: 'Not found' });
 
-    const { days } = req.body;
-    const updated = await renewOrder(order.id, days || order.durationDays);
-    res.json(updated);
+    const product = await getProductById(order.productId);
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+
+    const days = Number(req.body.days) || product.durationDays || order.durationDays;
+    const amount = product.price;
+
+    try {
+      const updated = await renewOrderWithWallet(user.id, order.id, amount, days);
+      res.json(updated);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Renew failed' });
+    }
   }));
 
   router.post('/v1/orders/:id/volume', authMiddleware, ah(async (req: any, res: any) => {
     const user = await getUserByTelegramId(req.telegramId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    const order = await getOrderById(parseInt(req.params.id));
+    const order = await getOrderById(parseInt(req.params.id, 10));
     if (!order || order.userId !== user.id) return res.status(404).json({ error: 'Not found' });
 
-    const { gb } = req.body;
-    const updated = await addVolumeToOrder(order.id, gb || 1);
-    res.json(updated);
+    const gb = Math.max(1, Math.min(1000, Number(req.body.gb) || 10));
+    const amount = config.VOLUME_GB_PRICE * gb;
+    if (amount <= 0) return res.status(400).json({ error: 'Volume top-up not configured' });
+
+    try {
+      const updated = await addVolumeWithWallet(user.id, order.id, gb, amount);
+      res.json(updated);
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Volume add failed' });
+    }
   }));
 
   // === Wallet ===
@@ -213,6 +227,68 @@ export function createApiRouter(): Router {
     res.json({ balance: user.balance, transactions: txs });
   }));
 
+  router.post('/v1/wallet/charge', authMiddleware, ah(async (req: any, res: any) => {
+    const user = await getUserByTelegramId(req.telegramId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const amount = parseInt(req.body.amount, 10);
+    const gateway = (req.body.gateway || 'zarinpal') as string;
+    if (!amount || amount < 1000) return res.status(400).json({ error: 'Invalid amount' });
+
+    if (gateway === 'zarinpal') {
+      if (!config.ZARINPAL_MERCHANT_ID) return res.status(400).json({ error: 'Zarinpal not configured' });
+      const result = await zarinpalRequest({
+        amount,
+        userId: user.id,
+        description: `Wallet charge ${amount}`,
+      });
+      if (!result.success || !result.paymentUrl) {
+        return res.status(400).json({ error: result.error || 'Payment request failed' });
+      }
+      const payment = await createPendingPayment({
+        userId: user.id,
+        amount,
+        gateway: 'zarinpal',
+        purpose: 'wallet_charge',
+        description: `Wallet charge: ${amount}`,
+        authority: result.authority,
+        refId: result.authority,
+      });
+      return res.json({ paymentId: payment.id, paymentUrl: result.paymentUrl });
+    }
+
+    if (gateway === 'card') {
+      const payment = await createPendingPayment({
+        userId: user.id,
+        amount,
+        gateway: 'card',
+        purpose: 'wallet_charge',
+        description: `Wallet charge: ${amount}`,
+      });
+      return res.json({
+        paymentId: payment.id,
+        card: config.CARD_NUMBER,
+        holder: config.CARD_HOLDER,
+        amount,
+      });
+    }
+
+    return res.status(400).json({ error: 'Unsupported gateway' });
+  }));
+
+  router.post('/v1/gift/redeem', authMiddleware, ah(async (req: any, res: any) => {
+    const user = await getUserByTelegramId(req.telegramId);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'Code required' });
+    try {
+      const gift = await redeemGiftCode(user.id, code);
+      res.json({ success: true, amount: gift.amount });
+    } catch (err: any) {
+      res.status(400).json({ error: err.message || 'Invalid gift code' });
+    }
+  }));
+
   // === Referral ===
   router.get('/v1/referral', authMiddleware, ah(async (req: any, res: any) => {
     const user = await getUserByTelegramId(req.telegramId);
@@ -227,25 +303,12 @@ export function createApiRouter(): Router {
     });
   }));
 
-  // === Discount ===
+  // === Discount preview (no consume) ===
   router.post('/v1/discount/apply', authMiddleware, ah(async (req: any, res: any) => {
     const { code } = req.body;
     if (!code) return res.status(400).json({ error: 'Code required' });
-
-    const discount = await db.query.discountCodes.findFirst({
-      where: eq(discountCodes.code, code),
-    });
-
-    if (!discount || !discount.isActive) {
-      return res.status(404).json({ error: 'Invalid code' });
-    }
-    if (discount.expireAt && discount.expireAt < new Date()) {
-      return res.status(400).json({ error: 'Code expired' });
-    }
-    if (discount.maxUses && discount.usedCount >= discount.maxUses) {
-      return res.status(400).json({ error: 'Code used up' });
-    }
-
+    const discount = await validateDiscountCode(code);
+    if (!discount) return res.status(404).json({ error: 'Invalid code' });
     res.json({ percent: discount.percent, valid: true });
   }));
 
@@ -253,7 +316,6 @@ export function createApiRouter(): Router {
   router.post('/v1/trial', authMiddleware, ah(async (req: any, res: any) => {
     const user = await getUserByTelegramId(req.telegramId);
     if (!user) return res.status(404).json({ error: 'User not found' });
-
     if (!config.TRIAL_ENABLED) return res.status(400).json({ error: 'Trial disabled' });
 
     const existingTrial = await db.query.trials.findFirst({
@@ -261,61 +323,96 @@ export function createApiRouter(): Router {
     });
     if (existingTrial) return res.status(400).json({ error: 'Trial already used' });
 
-    const result = await createOrder({
-      userId: user.id,
-      productId: 1,
-      isTrial: true,
-      finalPrice: 0,
+    const trialProduct = await db.query.products.findFirst({
+      where: eq(products.isActive, true),
     });
+    if (!trialProduct) return res.status(400).json({ error: 'No products available for trial' });
 
-    await db.insert(trials).values({
-      userId: user.id,
-      orderId: result.order.id,
-      expireAt: new Date(Date.now() + config.TRIAL_DAYS * 24 * 60 * 60 * 1000),
-    });
+    try {
+      const result = await createOrder({
+        userId: user.id,
+        productId: trialProduct.id,
+        isTrial: true,
+        finalPrice: 0,
+      });
 
-    res.json(result);
+      try {
+        await db.insert(trials).values({
+          userId: user.id,
+          orderId: result.order.id,
+          productId: trialProduct.id,
+          expireAt: new Date(Date.now() + config.TRIAL_DAYS * 24 * 60 * 60 * 1000),
+        });
+      } catch {
+        return res.status(400).json({ error: 'Trial already used' });
+      }
+
+      res.json(result);
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Trial failed' });
+    }
   }));
 
-  // === Payment Callbacks ===
+  // === Zarinpal callback ===
   router.get('/v1/payment/zarinpal/callback', ah(async (req: any, res: any) => {
     const { Authority, Status } = req.query;
+    const redirectBase = config.MINIAPP_URL || config.DOMAIN || '/';
+
     if (Status !== 'OK' || !Authority) {
-      return res.redirect(`${config.MINIAPP_URL || '/'}?payment=failed`);
+      return res.redirect(`${redirectBase}?payment=failed`);
     }
 
-    // Find pending payment with this authority
     const payment = await db.query.payments.findFirst({
       where: and(eq(payments.refId, Authority as string), eq(payments.status, 'pending')),
     });
-    if (!payment) return res.redirect(`${config.MINIAPP_URL || '/'}?payment=notfound`);
 
-    // Verify with Zarinpal
-    const { zarinpalVerify } = await import('../payments/index.js');
-    const verified = await zarinpalVerify(Authority as string, payment.amount);
+    // Also try authority column
+    const payment2 =
+      payment ||
+      (await db.query.payments.findFirst({
+        where: and(eq(payments.authority, Authority as string), eq(payments.status, 'pending')),
+      }));
 
-    if (verified.success) {
-      await db.update(payments).set({ status: 'confirmed' }).where(eq(payments.id, payment.id));
-      // Credit wallet
-      await db.update(users).set({ balance: sql`${users.balance} + ${payment.amount}`, updatedAt: new Date() }).where(eq(users.id, payment.userId));
-      await db.insert(walletTransactions).values({
-        userId: payment.userId,
-        amount: payment.amount,
-        type: 'charge',
-        description: `Zarinpal payment #${payment.id}`,
-      });
-      return res.redirect(`${config.MINIAPP_URL || '/'}?payment=success`);
+    if (!payment2) return res.redirect(`${redirectBase}?payment=notfound`);
+
+    const verified = await zarinpalVerify(Authority as string, payment2.amount);
+    if (!verified.success) {
+      return res.redirect(`${redirectBase}?payment=failed`);
     }
 
-    await db.update(payments).set({ status: 'rejected' }).where(eq(payments.id, payment.id));
-    return res.redirect(`${config.MINIAPP_URL || '/'}?payment=failed`);
+    const result = await confirmAndFulfillPayment(payment2.id, true);
+    if (!result.ok && result.reason === 'already_processed') {
+      return res.redirect(`${redirectBase}?payment=success`);
+    }
+    if (!result.ok) return res.redirect(`${redirectBase}?payment=failed`);
+
+    return res.redirect(`${redirectBase}?payment=success`);
   }));
 
-  // === Support ===
+  // NowPayments IPN (best-effort)
+  router.post('/v1/payment/nowpayments/ipn', ah(async (req: any, res: any) => {
+    const body = req.body || {};
+    const paymentStatus = body.payment_status || body.status;
+    const invoiceId = String(body.invoice_id || body.id || body.order_id || '');
+    if (!invoiceId) return res.status(400).json({ error: 'missing id' });
+
+    if (!['finished', 'confirmed', 'paid', 'complete'].includes(String(paymentStatus).toLowerCase())) {
+      return res.json({ ok: true, ignored: true });
+    }
+
+    const payment = await db.query.payments.findFirst({
+      where: and(eq(payments.refId, invoiceId), eq(payments.status, 'pending')),
+    });
+    if (!payment) return res.json({ ok: true, notFound: true });
+
+    await confirmAndFulfillPayment(payment.id, true);
+    res.json({ ok: true });
+  }));
+
   router.get('/v1/support/faq', authMiddleware, ah(async (_req: any, res: any) => {
     res.json([
       { q: 'How to connect?', a: 'Import the config link in your VPN client app.' },
-      { q: 'How to renew?', a: 'Go to My Services, select the service, and click Renew.' },
+      { q: 'How to renew?', a: 'Go to My Services, select the service, and click Renew (wallet balance required).' },
       { q: 'Payment issues?', a: 'Contact support with your receipt.' },
     ]);
   }));

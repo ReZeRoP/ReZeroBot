@@ -1,16 +1,33 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Lock } from 'lucide-react';
+import { toast } from 'sonner';
+import { adminApi, setAdminToken, getAdminToken } from '../api/client';
+import { useEffect } from 'react';
 
 export function Login() {
   const navigate = useNavigate();
-  const [username, setUsername] = useState('');
+  const [username, setUsername] = useState('admin');
   const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  useEffect(() => {
+    if (getAdminToken()) navigate('/', { replace: true });
+  }, [navigate]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    // TODO: Call login API
-    navigate('/');
+    setLoading(true);
+    try {
+      const res = await adminApi.login(username, password);
+      setAdminToken(res.token);
+      toast.success('ورود موفق');
+      navigate('/', { replace: true });
+    } catch (err: any) {
+      toast.error(err.message || 'ورود ناموفق');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -24,7 +41,10 @@ export function Login() {
           <p className="text-sm text-gray-500 mt-1">VPN Bot Admin Panel</p>
         </div>
 
-        <form onSubmit={handleSubmit} className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 space-y-4">
+        <form
+          onSubmit={handleSubmit}
+          className="bg-white rounded-2xl shadow-sm border border-gray-100 p-6 space-y-4"
+        >
           <div>
             <label className="text-sm font-medium text-gray-700 block mb-1">نام کاربری</label>
             <input
@@ -34,6 +54,7 @@ export function Login() {
               className="w-full px-4 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               placeholder="admin"
               dir="ltr"
+              autoComplete="username"
             />
           </div>
           <div>
@@ -45,13 +66,15 @@ export function Login() {
               className="w-full px-4 py-2.5 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
               placeholder="••••••••"
               dir="ltr"
+              autoComplete="current-password"
             />
           </div>
           <button
             type="submit"
-            className="w-full py-3 bg-blue-600 text-white rounded-lg font-medium text-sm hover:bg-blue-700 transition-colors"
+            disabled={loading}
+            className="w-full py-3 bg-blue-600 text-white rounded-lg font-medium text-sm hover:bg-blue-700 transition-colors disabled:opacity-50"
           >
-            ورود
+            {loading ? '...' : 'ورود'}
           </button>
         </form>
       </div>

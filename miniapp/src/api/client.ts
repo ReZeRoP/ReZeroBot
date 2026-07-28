@@ -1,9 +1,25 @@
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3000/api';
 
-let authToken: string | null = null;
+const TOKEN_KEY = 'rz_token';
+
+let authToken: string | null = typeof localStorage !== 'undefined' ? localStorage.getItem(TOKEN_KEY) : null;
 
 export function setToken(token: string) {
   authToken = token;
+  try {
+    localStorage.setItem(TOKEN_KEY, token);
+  } catch {
+    /* */
+  }
+}
+
+export function clearToken() {
+  authToken = null;
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* */
+  }
 }
 
 export function getToken() {
@@ -31,45 +47,45 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
-  // Auth
   authTelegram: (initData: string) =>
     request<{ token: string; user: any }>('/v1/auth/telegram', {
       method: 'POST',
       body: JSON.stringify({ initData }),
     }),
 
-  // User
   getProfile: () => request<any>('/v1/user/profile'),
 
-  // Products
   getProducts: () => request<any[]>('/v1/products'),
 
-  // Orders
   getOrders: () => request<any[]>('/v1/orders'),
   getOrder: (id: number) => request<any>(`/v1/orders/${id}`),
   createOrder: (data: { productId: number; discountCode?: string }) =>
     request<any>('/v1/orders', { method: 'POST', body: JSON.stringify(data) }),
-  renewOrder: (id: number, days: number) =>
+  renewOrder: (id: number, days?: number) =>
     request<any>(`/v1/orders/${id}/renew`, { method: 'POST', body: JSON.stringify({ days }) }),
   addVolume: (id: number, gb: number) =>
     request<any>(`/v1/orders/${id}/volume`, { method: 'POST', body: JSON.stringify({ gb }) }),
 
-  // Wallet
   getWallet: () => request<{ balance: number; transactions: any[] }>('/v1/wallet'),
+  chargeWallet: (amount: number, gateway: string = 'zarinpal') =>
+    request<any>('/v1/wallet/charge', {
+      method: 'POST',
+      body: JSON.stringify({ amount, gateway }),
+    }),
 
-  // Referral
-  getReferral: () => request<{ link: string; code: string; count: number; earnings: number }>('/v1/referral'),
+  redeemGift: (code: string) =>
+    request<any>('/v1/gift/redeem', { method: 'POST', body: JSON.stringify({ code }) }),
 
-  // Discount
+  getReferral: () =>
+    request<{ link: string; code: string; count: number; earnings: number }>('/v1/referral'),
+
   applyDiscount: (code: string) =>
     request<{ percent: number; valid: boolean }>('/v1/discount/apply', {
       method: 'POST',
       body: JSON.stringify({ code }),
     }),
 
-  // Trial
   requestTrial: () => request<any>('/v1/trial', { method: 'POST' }),
 
-  // Support
   getFaq: () => request<Array<{ q: string; a: string }>>('/v1/support/faq'),
 };

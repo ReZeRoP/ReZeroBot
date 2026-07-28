@@ -29,8 +29,12 @@ export class SanaeiClient {
   private readonly SESSION_TTL = 30 * 60 * 1000; // 30 minutes
 
   constructor(url?: string, apiKey?: string, username?: string, password?: string) {
-    this.baseUrl = (url || config.PANEL_URL).replace(/\/$/, '');
-    this.panelOrigin = new URL(this.baseUrl).origin;
+    this.baseUrl = (url || config.PANEL_URL || 'http://localhost').replace(/\/$/, '');
+    try {
+      this.panelOrigin = new URL(this.baseUrl).origin;
+    } catch {
+      this.panelOrigin = this.baseUrl;
+    }
     this.apiKey = apiKey || config.PANEL_API_KEY;
     this.username = username || config.PANEL_USERNAME;
     this.password = password || config.PANEL_PASSWORD;

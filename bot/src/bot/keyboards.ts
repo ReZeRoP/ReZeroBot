@@ -28,7 +28,7 @@ export function categoryKeyboard(
 ): InlineKeyboard {
   const kb = new InlineKeyboard();
   for (const cat of categories) {
-    const label = lang === 'fa' ? cat.name : (cat.nameEn || cat.name);
+    const label = lang === 'fa' ? cat.name : cat.nameEn || cat.name;
     kb.text(label, `cat:${cat.id}`).row();
   }
   return kb;
@@ -40,7 +40,7 @@ export function productKeyboard(
 ): InlineKeyboard {
   const kb = new InlineKeyboard();
   for (const p of products) {
-    const label = lang === 'fa' ? p.name : (p.nameEn || p.name);
+    const label = lang === 'fa' ? p.name : p.nameEn || p.name;
     kb.text(`${label} - ${p.price.toLocaleString()}`, `prod:${p.id}`).row();
   }
   kb.text(t(lang, 'shop_back'), 'shop:back');
@@ -56,9 +56,15 @@ export function confirmPurchaseKeyboard(lang: Language): InlineKeyboard {
 export function paymentMethodKeyboard(lang: Language, balance: number): InlineKeyboard {
   const kb = new InlineKeyboard();
   kb.text(t(lang, 'payment_wallet', { balance: balance.toLocaleString() }), 'pay:wallet').row();
-  kb.text(t(lang, 'payment_card'), 'pay:card').row();
-  kb.text(t(lang, 'payment_zarinpal'), 'pay:zarinpal').row();
-  kb.text(t(lang, 'payment_nowpayments'), 'pay:nowpayments').row();
+  if (config.CARD_NUMBER) {
+    kb.text(t(lang, 'payment_card'), 'pay:card').row();
+  }
+  if (config.ZARINPAL_MERCHANT_ID) {
+    kb.text(t(lang, 'payment_zarinpal'), 'pay:zarinpal').row();
+  }
+  if (config.NOWPAYMENTS_API_KEY) {
+    kb.text(t(lang, 'payment_nowpayments'), 'pay:nowpayments').row();
+  }
   kb.text(t(lang, 'shop_cancel'), 'buy:cancel');
   return kb;
 }
@@ -78,6 +84,8 @@ export function walletKeyboard(lang: Language): InlineKeyboard {
   return new InlineKeyboard()
     .text(t(lang, 'wallet_charge'), 'wallet:charge')
     .text(t(lang, 'wallet_history'), 'wallet:history')
+    .row()
+    .text(t(lang, 'gift_enter_btn'), 'wallet:gift')
     .row()
     .text(t(lang, 'back_to_menu'), 'menu:main');
 }
@@ -101,7 +109,9 @@ export function supportKeyboard(lang: Language): InlineKeyboard {
 export function channelCheckKeyboard(lang: Language): InlineKeyboard {
   const channelUrl = config.CHANNEL_ID.startsWith('@')
     ? `https://t.me/${config.CHANNEL_ID.slice(1)}`
-    : config.CHANNEL_ID;
+    : config.CHANNEL_ID.startsWith('http')
+      ? config.CHANNEL_ID
+      : `https://t.me/c/${String(config.CHANNEL_ID).replace('-100', '')}`;
   return new InlineKeyboard()
     .url(t(lang, 'channel_join'), channelUrl)
     .row()

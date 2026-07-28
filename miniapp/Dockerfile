@@ -5,6 +5,9 @@ RUN corepack enable && corepack prepare pnpm@9 --activate
 
 WORKDIR /app
 
+ARG VITE_API_URL=/api
+ENV VITE_API_URL=$VITE_API_URL
+
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml* ./
 COPY miniapp/package.json ./miniapp/
 

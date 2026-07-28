@@ -89,6 +89,7 @@ export const fa = {
 
   // Gift
   gift_enter: '🎁 کد هدیه خود را وارد کنید:',
+  gift_enter_btn: '🎁 کد هدیه',
   gift_redeemed: '✅ کد هدیه اعمال شد! {amount} تومان به کیف پول شما اضافه شد.',
   gift_invalid: '❌ کد هدیه نامعتبر یا استفاده شده است.',
 

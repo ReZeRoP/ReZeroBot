@@ -35,6 +35,7 @@ export const walletTxTypeEnum = pgEnum('wallet_tx_type', [
   'gift',
   'admin_adjust',
   'lottery',
+  'refund',
 ]);
 export const lotteryStatusEnum = pgEnum('lottery_status', ['pending', 'active', 'drawn', 'cancelled']);
 export const adminRoleEnum = pgEnum('admin_role', ['owner', 'admin', 'support']);
@@ -48,7 +49,7 @@ export const users = pgTable(
     username: varchar('username', { length: 255 }),
     firstName: varchar('first_name', { length: 255 }),
     lastName: varchar('last_name', { length: 255 }),
-    balance: bigint('balance', { mode: 'number' }).notNull().default(0), // in Tomans
+    balance: bigint('balance', { mode: 'number' }).notNull().default(0), // Tomans
     language: languageEnum('language').notNull().default('fa'),
     refCode: varchar('ref_code', { length: 12 }).notNull(),
     referredBy: integer('referred_by'),
@@ -78,12 +79,14 @@ export const panels = pgTable('panels', {
   createdAt: timestamp('created_at').notNull().defaultNow(),
 });
 
-// === Inbounds ===
+// === Inbounds (local catalog; panelInboundId is the 3x-ui id) ===
 export const inbounds = pgTable('inbounds', {
   id: serial('id').primaryKey(),
   panelId: integer('panel_id')
     .notNull()
     .references(() => panels.id, { onDelete: 'cascade' }),
+  /** Actual inbound id on the 3x-ui panel */
+  panelInboundId: integer('panel_inbound_id'),
   remark: varchar('remark', { length: 255 }).notNull(),
   port: integer('port').notNull(),
   protocol: varchar('protocol', { length: 50 }).notNull(),
@@ -108,11 +111,15 @@ export const products = pgTable('products', {
   categoryId: integer('category_id')
     .notNull()
     .references(() => categories.id, { onDelete: 'cascade' }),
-  inboundId: integer('inbound_id').references(() => inbounds.id, { onDelete: 'set null' }),
+  /**
+   * 3x-ui panel inbound ID (NOT the local inbounds.id).
+   * Stored as plain integer so admins can set the panel's inbound number directly.
+   */
+  inboundId: integer('inbound_id'),
   name: varchar('name', { length: 255 }).notNull(),
   nameEn: varchar('name_en', { length: 255 }),
   description: text('description'),
-  price: bigint('price', { mode: 'number' }).notNull(), // in Tomans
+  price: bigint('price', { mode: 'number' }).notNull(), // Tomans
   volumeGb: integer('volume_gb').notNull().default(0), // 0 = unlimited
   durationDays: integer('duration_days').notNull().default(30),
   protocol: varchar('protocol', { length: 50 }).default('vless'),
@@ -130,6 +137,9 @@ export const orders = pgTable('orders', {
   productId: integer('product_id')
     .notNull()
     .references(() => products.id),
+  /** 3x-ui panel inbound id used when the client was created */
+  panelInboundId: integer('panel_inbound_id'),
+  /** @deprecated use panelInboundId — kept for backward compatibility */
   panelUserId: integer('panel_user_id'),
   status: orderStatusEnum('status').notNull().default('pending'),
   configLink: text('config_link'),
@@ -141,6 +151,7 @@ export const orders = pgTable('orders', {
   isTrial: boolean('is_trial').notNull().default(false),
   discountCode: varchar('discount_code', { length: 50 }),
   finalPrice: bigint('final_price', { mode: 'number' }).notNull().default(0),
+  reminderSentAt: timestamp('reminder_sent_at'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
   activatedAt: timestamp('activated_at'),
 });
@@ -152,6 +163,10 @@ export const payments = pgTable('payments', {
     .notNull()
     .references(() => users.id, { onDelete: 'cascade' }),
   orderId: integer('order_id').references(() => orders.id, { onDelete: 'set null' }),
+  /** When purpose is product_purchase */
+  productId: integer('product_id'),
+  /** wallet_charge | product_purchase */
+  purpose: varchar('purpose', { length: 32 }).notNull().default('wallet_charge'),
   gateway: paymentGatewayEnum('gateway').notNull(),
   amount: bigint('amount', { mode: 'number' }).notNull(),
   status: paymentStatusEnum('status').notNull().default('pending'),
@@ -159,6 +174,7 @@ export const payments = pgTable('payments', {
   authority: varchar('authority', { length: 255 }),
   receiptPhoto: varchar('receipt_photo', { length: 500 }),
   description: text('description'),
+  discountCode: varchar('discount_code', { length: 50 }),
   paidAt: timestamp('paid_at'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
 });
@@ -169,34 +185,42 @@ export const walletTransactions = pgTable('wallet_transactions', {
   userId: integer('user_id')
     .notNull()
     .references(() => users.id, { onDelete: 'cascade' }),
-  amount: bigint('amount', { mode: 'number' }).notNull(), // positive = credit, negative = debit
+  amount: bigint('amount', { mode: 'number' }).notNull(),
   type: walletTxTypeEnum('type').notNull(),
   description: text('description'),
   createdAt: timestamp('created_at').notNull().defaultNow(),
 });
 
 // === Discount Codes ===
-export const discountCodes = pgTable('discount_codes', {
-  id: serial('id').primaryKey(),
-  code: varchar('code', { length: 50 }).notNull(),
-  percent: integer('percent').notNull(),
-  maxUses: integer('max_uses').default(0), // 0 = unlimited
-  usedCount: integer('used_count').notNull().default(0),
-  expireAt: timestamp('expire_at'),
-  isActive: boolean('is_active').notNull().default(true),
-  createdAt: timestamp('created_at').notNull().defaultNow(),
-});
+export const discountCodes = pgTable(
+  'discount_codes',
+  {
+    id: serial('id').primaryKey(),
+    code: varchar('code', { length: 50 }).notNull(),
+    percent: integer('percent').notNull(),
+    maxUses: integer('max_uses').default(0), // 0 = unlimited
+    usedCount: integer('used_count').notNull().default(0),
+    expireAt: timestamp('expire_at'),
+    isActive: boolean('is_active').notNull().default(true),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('discount_codes_code_idx').on(table.code)],
+);
 
 // === Gift Codes ===
-export const giftCodes = pgTable('gift_codes', {
-  id: serial('id').primaryKey(),
-  code: varchar('code', { length: 50 }).notNull(),
-  amount: bigint('amount', { mode: 'number' }).notNull(),
-  usedBy: integer('used_by').references(() => users.id, { onDelete: 'set null' }),
-  isUsed: boolean('is_used').notNull().default(false),
-  createdAt: timestamp('created_at').notNull().defaultNow(),
-  usedAt: timestamp('used_at'),
-});
+export const giftCodes = pgTable(
+  'gift_codes',
+  {
+    id: serial('id').primaryKey(),
+    code: varchar('code', { length: 50 }).notNull(),
+    amount: bigint('amount', { mode: 'number' }).notNull(),
+    usedBy: integer('used_by').references(() => users.id, { onDelete: 'set null' }),
+    isUsed: boolean('is_used').notNull().default(false),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+    usedAt: timestamp('used_at'),
+  },
+  (table) => [uniqueIndex('gift_codes_code_idx').on(table.code)],
+);
 
 // === Referrals ===
 export const referrals = pgTable('referrals', {
@@ -212,23 +236,31 @@ export const referrals = pgTable('referrals', {
 });
 
 // === Settings (KV Store) ===
-export const settings = pgTable('settings', {
-  id: serial('id').primaryKey(),
-  key: varchar('key', { length: 255 }).notNull(),
-  value: text('value'),
-  updatedAt: timestamp('updated_at').notNull().defaultNow(),
-});
+export const settings = pgTable(
+  'settings',
+  {
+    id: serial('id').primaryKey(),
+    key: varchar('key', { length: 255 }).notNull(),
+    value: text('value'),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('settings_key_idx').on(table.key)],
+);
 
 // === Admins ===
-export const admins = pgTable('admins', {
-  id: serial('id').primaryKey(),
-  telegramId: bigint('telegram_id', { mode: 'number' }).notNull(),
-  username: varchar('username', { length: 255 }),
-  role: adminRoleEnum('role').notNull().default('admin'),
-  loginUsername: varchar('login_username', { length: 100 }),
-  loginPassword: varchar('login_password', { length: 255 }),
-  createdAt: timestamp('created_at').notNull().defaultNow(),
-});
+export const admins = pgTable(
+  'admins',
+  {
+    id: serial('id').primaryKey(),
+    telegramId: bigint('telegram_id', { mode: 'number' }).notNull(),
+    username: varchar('username', { length: 255 }),
+    role: adminRoleEnum('role').notNull().default('admin'),
+    loginUsername: varchar('login_username', { length: 100 }),
+    loginPassword: varchar('login_password', { length: 255 }),
+    createdAt: timestamp('created_at').notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('admins_telegram_id_idx').on(table.telegramId)],
+);
 
 // === Lotteries ===
 export const lotteries = pgTable('lotteries', {
@@ -257,22 +289,30 @@ export const lotteryEntries = pgTable('lottery_entries', {
 });
 
 // === Messages (Customizable Bot Texts) ===
-export const messages = pgTable('messages', {
-  id: serial('id').primaryKey(),
-  key: varchar('key', { length: 255 }).notNull(),
-  faText: text('fa_text'),
-  enText: text('en_text'),
-  updatedAt: timestamp('updated_at').notNull().defaultNow(),
-});
+export const messages = pgTable(
+  'messages',
+  {
+    id: serial('id').primaryKey(),
+    key: varchar('key', { length: 255 }).notNull(),
+    faText: text('fa_text'),
+    enText: text('en_text'),
+    updatedAt: timestamp('updated_at').notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('messages_key_idx').on(table.key)],
+);
 
-// === Trials ===
-export const trials = pgTable('trials', {
-  id: serial('id').primaryKey(),
-  userId: integer('user_id')
-    .notNull()
-    .references(() => users.id, { onDelete: 'cascade' }),
-  productId: integer('product_id').references(() => products.id),
-  orderId: integer('order_id').references(() => orders.id),
-  expireAt: timestamp('expire_at').notNull(),
-  usedAt: timestamp('used_at').notNull().defaultNow(),
-});
+// === Trials (one per user) ===
+export const trials = pgTable(
+  'trials',
+  {
+    id: serial('id').primaryKey(),
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    productId: integer('product_id').references(() => products.id),
+    orderId: integer('order_id').references(() => orders.id),
+    expireAt: timestamp('expire_at').notNull(),
+    usedAt: timestamp('used_at').notNull().defaultNow(),
+  },
+  (table) => [uniqueIndex('trials_user_id_idx').on(table.userId)],
+);

@@ -18,12 +18,22 @@ import {
   channelCheckKeyboard,
 } from './keyboards.js';
 import { getActiveCategories, getProductsByCategory, getProductById } from '../services/product.service.js';
-import { getActiveOrders, purchaseWithWallet, getOrderById, createOrder } from '../services/order.service.js';
+import {
+  getActiveOrders,
+  purchaseWithWallet,
+  getOrderById,
+  createOrder,
+  renewOrderWithWallet,
+  addVolumeWithWallet,
+} from '../services/order.service.js';
 import { formatPrice, formatVolume, formatDuration } from '../i18n/index.js';
 import { db } from '../db/index.js';
-import { payments, trials, discountCodes, users, walletTransactions, products } from '../db/schema.js';
-import { eq, sql } from 'drizzle-orm';
-import { zarinpalRequest } from '../payments/index.js';
+import { payments, trials, products, walletTransactions } from '../db/schema.js';
+import { eq, desc } from 'drizzle-orm';
+import { zarinpalRequest, nowpaymentsRequest } from '../payments/index.js';
+import { createPendingPayment, confirmAndFulfillPayment, rejectPaymentAndNotify } from '../services/payment.service.js';
+import { validateDiscountCode, priceAfterDiscount, redeemGiftCode } from '../services/discount.service.js';
+import { createRedisSessionStorage } from '../db/redis.js';
 
 interface SessionData {
   step?: string;
@@ -35,23 +45,37 @@ interface SessionData {
 
 type BotContext = Context & SessionFlavor<SessionData>;
 
+async function answer(ctx: BotContext, text?: string, showAlert = false) {
+  try {
+    await ctx.answerCallbackQuery(text ? { text, show_alert: showAlert } : undefined);
+  } catch {
+    /* already answered or too old */
+  }
+}
+
 export function createBot() {
   const bot = new Bot<BotContext>(config.BOT_TOKEN);
 
-  bot.use(session({ initial: (): SessionData => ({}) }));
+  bot.use(
+    session({
+      initial: (): SessionData => ({}),
+      storage: createRedisSessionStorage<SessionData>(),
+    }),
+  );
 
-  // === Channel membership check helper ===
   async function checkChannelMembership(ctx: BotContext, telegramId: number): Promise<boolean> {
     if (!config.CHANNEL_ENABLED || !config.CHANNEL_ID) return true;
     try {
       const member = await ctx.api.getChatMember(config.CHANNEL_ID, telegramId);
       return ['member', 'administrator', 'creator'].includes(member.status);
     } catch {
-      return true; // If we can't check, don't block
+      // Fail closed when channel is required but check fails? Prefer open to avoid lockouts.
+      console.error('[BOT] Channel membership check failed');
+      return true;
     }
   }
 
-  // === /start command ===
+  // === /start ===
   bot.command('start', async (ctx) => {
     const telegramId = ctx.from?.id;
     if (!telegramId) return;
@@ -75,7 +99,6 @@ export function createBot() {
 
     const lang = user.language as Language;
 
-    // New user: show language selection
     if (isNew) {
       return ctx.reply(t('fa', 'welcome'), { reply_markup: languageKeyboard() });
     }
@@ -85,14 +108,26 @@ export function createBot() {
     });
   });
 
-  // === /help command ===
   bot.command('help', async (ctx) => {
     const user = await getUserByTelegramId(ctx.from?.id || 0);
     const lang = (user?.language || 'fa') as Language;
     await ctx.reply(t(lang, 'support_menu'), { reply_markup: supportKeyboard(lang) });
   });
 
-  // === Text message handlers ===
+  bot.command('skip', async (ctx) => {
+    if (ctx.session.step === 'awaiting_discount') {
+      ctx.session.step = undefined;
+      ctx.session.discountCode = undefined;
+      const user = await getUserByTelegramId(ctx.from?.id || 0);
+      if (!user) return;
+      const lang = user.language as Language;
+      return ctx.reply(t(lang, 'payment_select_method'), {
+        reply_markup: paymentMethodKeyboard(lang, user.balance),
+      });
+    }
+  });
+
+  // === Text messages ===
   bot.on('message:text', async (ctx) => {
     const user = await getUserByTelegramId(ctx.from?.id || 0);
     if (!user) return;
@@ -101,21 +136,20 @@ export function createBot() {
     const lang = user.language as Language;
     const text = ctx.message.text;
 
-    // === Handle multi-step flows first ===
     if (ctx.session.step === 'awaiting_charge_amount') {
       ctx.session.step = undefined;
-      const amount = parseInt(text.replace(/[,،\s]/g, ''));
+      const amount = parseInt(text.replace(/[,،\s]/g, ''), 10);
       if (isNaN(amount) || amount < 1000) {
         return ctx.reply(t(lang, 'error_generic'), { reply_markup: mainMenuKeyboard(lang) });
       }
-      // Create pending payment for wallet charge
-      const [payment] = await db.insert(payments).values({
+
+      const payment = await createPendingPayment({
         userId: user.id,
         gateway: 'card',
         amount,
-        status: 'pending',
+        purpose: 'wallet_charge',
         description: `Wallet charge: ${amount}`,
-      }).returning();
+      });
 
       ctx.session.step = 'awaiting_receipt';
       ctx.session.pendingPayment = payment.id;
@@ -131,39 +165,50 @@ export function createBot() {
 
     if (ctx.session.step === 'awaiting_support_msg') {
       ctx.session.step = undefined;
-      // Forward message to admins
       for (const adminId of adminIds) {
         try {
-          await ctx.api.sendMessage(adminId,
-            `📩 Support message from ${ctx.from.first_name} (@${ctx.from.username || user.telegramId}):\n\n${text}`,
+          await ctx.api.sendMessage(
+            adminId,
+            `📩 Support from ${ctx.from.first_name} (@${ctx.from.username || user.telegramId}):\n\n${text}`,
           );
-        } catch { /* admin may not have started the bot */ }
+        } catch {
+          /* */
+        }
       }
       return ctx.reply(t(lang, 'support_sent'), { reply_markup: mainMenuKeyboard(lang) });
     }
 
     if (ctx.session.step === 'awaiting_discount') {
       ctx.session.step = undefined;
-      if (text === '➖' || text.toLowerCase() === 'skip') {
+      const trimmed = text.trim();
+      if (trimmed === '➖' || trimmed.toLowerCase() === 'skip' || trimmed === '/skip') {
         ctx.session.discountCode = undefined;
       } else {
-        const code = await db.query.discountCodes.findFirst({
-          where: eq(discountCodes.code, text.trim()),
-        });
-        if (!code || !code.isActive || (code.expireAt && code.expireAt < new Date()) || (code.maxUses && code.usedCount >= code.maxUses)) {
+        const code = await validateDiscountCode(trimmed);
+        if (!code) {
           return ctx.reply(t(lang, 'discount_invalid'), { reply_markup: mainMenuKeyboard(lang) });
         }
-        ctx.session.discountCode = text.trim();
+        ctx.session.discountCode = code.code;
+        await ctx.reply(t(lang, 'discount_applied', { percent: code.percent }));
       }
-      // Proceed to payment
       return ctx.reply(t(lang, 'payment_select_method'), {
         reply_markup: paymentMethodKeyboard(lang, user.balance),
       });
     }
 
-    // === Main menu actions ===
+    if (ctx.session.step === 'awaiting_gift') {
+      ctx.session.step = undefined;
+      try {
+        const gift = await redeemGiftCode(user.id, text);
+        return ctx.reply(t(lang, 'gift_redeemed', { amount: gift.amount.toLocaleString() }), {
+          reply_markup: mainMenuKeyboard(lang),
+        });
+      } catch {
+        return ctx.reply(t(lang, 'gift_invalid'), { reply_markup: mainMenuKeyboard(lang) });
+      }
+    }
+
     if (text === t(lang, 'menu_shop')) {
-      // Channel check
       if (!(await checkChannelMembership(ctx, ctx.from!.id))) {
         return ctx.reply(t(lang, 'channel_required'), { reply_markup: channelCheckKeyboard(lang) });
       }
@@ -180,7 +225,7 @@ export function createBot() {
 
       for (const order of orders.slice(0, 5)) {
         const product = await getProductById(order.productId);
-        const name = product ? (lang === 'fa' ? product.name : (product.nameEn || product.name)) : `#${order.id}`;
+        const name = product ? (lang === 'fa' ? product.name : product.nameEn || product.name) : `#${order.id}`;
         const status = order.status === 'active' ? '✅' : '⏳';
         await ctx.reply(`• ${name} | ${status}`, {
           reply_markup: serviceActionsKeyboard(order.id, lang),
@@ -222,373 +267,450 @@ export function createBot() {
     }
   });
 
-  // === Callback query handlers ===
+  // === Callbacks ===
   bot.on('callback_query:data', async (ctx) => {
     const user = await getUserByTelegramId(ctx.from?.id || 0);
-    if (!user) return ctx.answerCallbackQuery();
+    if (!user) return answer(ctx);
+    if (user.isBlocked) {
+      await answer(ctx, t(user.language as Language, 'error_blocked'), true);
+      return;
+    }
+
     const lang = user.language as Language;
     const data = ctx.callbackQuery.data;
 
-    // Language selection
-    if (data.startsWith('lang:')) {
-      const newLang = data.split(':')[1] as Language;
-      await updateUserLanguage(user.id, newLang);
-      return ctx.reply(t(newLang, 'welcomeBack', { name: ctx.from.first_name || 'User' }), {
-        reply_markup: mainMenuKeyboard(newLang),
-      });
-    }
-
-    // Channel check
-    if (data === 'check:channel') {
-      if (await checkChannelMembership(ctx, ctx.from.id)) {
-        const cats = await getActiveCategories();
-        return ctx.reply(t(lang, 'shop_select_category'), { reply_markup: categoryKeyboard(cats, lang) });
-      }
-      return ctx.answerCallbackQuery({ text: t(lang, 'channel_not_joined'), show_alert: true });
-    }
-
-    // Category selection
-    if (data.startsWith('cat:')) {
-      const catId = parseInt(data.split(':')[1]);
-      ctx.session.selectedCategory = catId;
-      const prods = await getProductsByCategory(catId);
-      if (prods.length === 0) return ctx.reply(t(lang, 'shop_no_products'));
-      return ctx.reply(t(lang, 'shop_select_product'), {
-        reply_markup: productKeyboard(prods, lang),
-      });
-    }
-
-    // Product selection
-    if (data.startsWith('prod:')) {
-      const prodId = parseInt(data.split(':')[1]);
-      ctx.session.selectedProduct = prodId;
-      const product = await getProductById(prodId);
-      if (!product) return ctx.reply(t(lang, 'error_not_found'));
-
-      const name = lang === 'fa' ? product.name : (product.nameEn || product.name);
-      return ctx.reply(
-        t(lang, 'shop_product_info', {
-          name,
-          price: formatPrice(product.price, lang),
-          volume: formatVolume(product.volumeGb, lang),
-          duration: formatDuration(product.durationDays, lang),
-        }),
-        { reply_markup: confirmPurchaseKeyboard(lang) },
-      );
-    }
-
-    // Purchase confirm → ask for discount code
-    if (data === 'buy:confirm') {
-      const prodId = ctx.session.selectedProduct;
-      if (!prodId) return ctx.reply(t(lang, 'error_generic'));
-      ctx.session.step = 'awaiting_discount';
-      return ctx.reply(t(lang, 'discount_enter'));
-    }
-
-    // Purchase cancel
-    if (data === 'buy:cancel') {
-      ctx.session.selectedProduct = undefined;
-      ctx.session.discountCode = undefined;
-      return ctx.reply(t(lang, 'back_to_menu'), { reply_markup: mainMenuKeyboard(lang) });
-    }
-
-    // Pay with wallet
-    if (data === 'pay:wallet') {
-      const prodId = ctx.session.selectedProduct;
-      if (!prodId) return ctx.reply(t(lang, 'error_generic'));
-
-      const product = await getProductById(prodId);
-      if (!product) return ctx.reply(t(lang, 'error_not_found'));
-
-      // Apply discount
-      let finalPrice = product.price;
-      if (ctx.session.discountCode) {
-        const code = await db.query.discountCodes.findFirst({
-          where: eq(discountCodes.code, ctx.session.discountCode),
+    try {
+      if (data.startsWith('lang:')) {
+        const newLang = data.split(':')[1] as Language;
+        await updateUserLanguage(user.id, newLang);
+        await answer(ctx);
+        return ctx.reply(t(newLang, 'welcomeBack', { name: ctx.from.first_name || 'User' }), {
+          reply_markup: mainMenuKeyboard(newLang),
         });
-        if (code && code.isActive) {
-          finalPrice = Math.round(finalPrice * (1 - Math.min(code.percent, 100) / 100));
-          // Increment usage
-          await db.update(discountCodes).set({ usedCount: sql`${discountCodes.usedCount} + 1` }).where(eq(discountCodes.id, code.id));
-        }
       }
 
-      if (user.balance < finalPrice) {
+      if (data === 'check:channel') {
+        if (await checkChannelMembership(ctx, ctx.from.id)) {
+          await answer(ctx, t(lang, 'channel_joined'));
+          const cats = await getActiveCategories();
+          return ctx.reply(t(lang, 'shop_select_category'), { reply_markup: categoryKeyboard(cats, lang) });
+        }
+        return answer(ctx, t(lang, 'channel_not_joined'), true);
+      }
+
+      if (data.startsWith('cat:')) {
+        const catId = parseInt(data.split(':')[1], 10);
+        ctx.session.selectedCategory = catId;
+        const prods = await getProductsByCategory(catId);
+        await answer(ctx);
+        if (prods.length === 0) return ctx.reply(t(lang, 'shop_no_products'));
+        return ctx.reply(t(lang, 'shop_select_product'), {
+          reply_markup: productKeyboard(prods, lang),
+        });
+      }
+
+      if (data.startsWith('prod:')) {
+        const prodId = parseInt(data.split(':')[1], 10);
+        ctx.session.selectedProduct = prodId;
+        const product = await getProductById(prodId);
+        await answer(ctx);
+        if (!product) return ctx.reply(t(lang, 'error_not_found'));
+
+        const name = lang === 'fa' ? product.name : product.nameEn || product.name;
         return ctx.reply(
-          t(lang, 'payment_insufficient', {
-            balance: user.balance.toLocaleString(),
-            required: finalPrice.toLocaleString(),
+          t(lang, 'shop_product_info', {
+            name,
+            price: formatPrice(product.price, lang),
+            volume: formatVolume(product.volumeGb, lang),
+            duration: formatDuration(product.durationDays, lang),
           }),
+          { reply_markup: confirmPurchaseKeyboard(lang) },
         );
       }
 
-      try {
-        const result = await purchaseWithWallet(user.id, prodId, finalPrice);
+      if (data === 'buy:confirm') {
+        const prodId = ctx.session.selectedProduct;
+        await answer(ctx);
+        if (!prodId) return ctx.reply(t(lang, 'error_generic'));
+        ctx.session.step = 'awaiting_discount';
+        return ctx.reply(t(lang, 'discount_enter'));
+      }
+
+      if (data === 'buy:cancel') {
         ctx.session.selectedProduct = undefined;
         ctx.session.discountCode = undefined;
-
-        return ctx.reply(
-          t(lang, 'config_created', {
-            username: result.email,
-            volume: formatVolume(product.volumeGb, lang),
-            expiry: result.order.expireAt?.toLocaleDateString(lang === 'fa' ? 'fa-IR' : 'en-US') || '-',
-            config: result.subLink,
-            sub: result.subLink,
-          }),
-          { reply_markup: mainMenuKeyboard(lang) },
-        );
-      } catch {
-        return ctx.reply(t(lang, 'error_generic'));
-      }
-    }
-
-    // Pay with card
-    if (data === 'pay:card') {
-      const prodId = ctx.session.selectedProduct;
-      if (!prodId) return ctx.reply(t(lang, 'error_generic'));
-      const product = await getProductById(prodId);
-      if (!product) return ctx.reply(t(lang, 'error_not_found'));
-
-      let finalPrice = product.price;
-      if (ctx.session.discountCode) {
-        const code = await db.query.discountCodes.findFirst({ where: eq(discountCodes.code, ctx.session.discountCode) });
-        if (code && code.isActive) finalPrice = Math.round(finalPrice * (1 - Math.min(code.percent, 100) / 100));
+        ctx.session.step = undefined;
+        await answer(ctx);
+        return ctx.reply(t(lang, 'back_to_menu'), { reply_markup: mainMenuKeyboard(lang) });
       }
 
-      // Create pending payment record
-      const [payment] = await db.insert(payments).values({
-        userId: user.id,
-        orderId: undefined,
-        gateway: 'card',
-        amount: finalPrice,
-        status: 'pending',
-        description: `Product #${prodId}`,
-      }).returning();
+      // --- Pay with wallet ---
+      if (data === 'pay:wallet') {
+        const prodId = ctx.session.selectedProduct;
+        await answer(ctx);
+        if (!prodId) return ctx.reply(t(lang, 'error_generic'));
 
-      ctx.session.step = 'awaiting_receipt';
-      ctx.session.pendingPayment = payment.id;
-
-      return ctx.reply(
-        t(lang, 'payment_card_info', {
-          amount: finalPrice.toLocaleString(),
-          card: config.CARD_NUMBER,
-          holder: config.CARD_HOLDER,
-        }),
-      );
-    }
-
-    // Pay with Zarinpal
-    if (data === 'pay:zarinpal') {
-      const prodId = ctx.session.selectedProduct;
-      if (!prodId) return ctx.reply(t(lang, 'error_generic'));
-      const product = await getProductById(prodId);
-      if (!product) return ctx.reply(t(lang, 'error_not_found'));
-
-      let finalPrice = product.price;
-      if (ctx.session.discountCode) {
-        const code = await db.query.discountCodes.findFirst({ where: eq(discountCodes.code, ctx.session.discountCode) });
-        if (code && code.isActive) finalPrice = Math.round(finalPrice * (1 - Math.min(code.percent, 100) / 100));
-      }
-
-      if (!config.ZARINPAL_MERCHANT_ID) return ctx.reply(t(lang, 'error_generic'));
-
-      try {
-        const result = await zarinpalRequest({ amount: finalPrice, userId: user.id, description: `Product #${prodId}` });
-        if (!result.success || !result.paymentUrl) return ctx.reply(t(lang, 'error_generic'));
-
-        const [payment] = await db.insert(payments).values({
-          userId: user.id,
-          gateway: 'zarinpal',
-          amount: finalPrice,
-          status: 'pending',
-          refId: result.authority,
-          description: `Product #${prodId}`,
-        }).returning();
-
-        ctx.session.pendingPayment = payment.id;
-        return ctx.reply(t(lang, 'payment_online_link'), {
-          reply_markup: { inline_keyboard: [[{ text: t(lang, 'payment_pay_button'), url: result.paymentUrl }]] },
-        });
-      } catch {
-        return ctx.reply(t(lang, 'error_generic'));
-      }
-    }
-
-    // Pay with crypto (NowPayments)
-    if (data === 'pay:nowpayments') {
-      const prodId = ctx.session.selectedProduct;
-      if (!prodId) return ctx.reply(t(lang, 'error_generic'));
-      const product = await getProductById(prodId);
-      if (!product) return ctx.reply(t(lang, 'error_not_found'));
-
-      if (!config.NOWPAYMENTS_API_KEY) return ctx.reply(t(lang, 'error_generic'));
-
-      try {
-        const { nowpaymentsRequest } = await import('../payments/index.js');
-        const result = await nowpaymentsRequest({ amount: product.price, userId: user.id, description: `Product #${prodId}` });
-        if (!result.success || !result.paymentUrl) return ctx.reply(t(lang, 'error_generic'));
-
-        await db.insert(payments).values({
-          userId: user.id,
-          gateway: 'nowpayments',
-          amount: product.price,
-          status: 'pending',
-          refId: result.refId,
-          description: `Product #${prodId}`,
-        });
-
-        return ctx.reply(t(lang, 'payment_online_link'), {
-          reply_markup: { inline_keyboard: [[{ text: t(lang, 'payment_pay_button'), url: result.paymentUrl }]] },
-        });
-      } catch {
-        return ctx.reply(t(lang, 'error_generic'));
-      }
-    }
-
-    // Service actions
-    if (data.startsWith('svc:')) {
-      const [, action, idStr] = data.split(':');
-      const orderId = parseInt(idStr);
-      const order = await getOrderById(orderId);
-      if (!order || order.userId !== user.id) return ctx.reply(t(lang, 'error_not_found'));
-
-      if (action === 'config' || action === 'sub') {
-        return ctx.reply(`🔗 ${order.subLink || 'N/A'}`);
-      }
-      if (action === 'renew') {
-        const product = await getProductById(order.productId);
+        const product = await getProductById(prodId);
         if (!product) return ctx.reply(t(lang, 'error_not_found'));
-        // Renew = purchase same product again with wallet
-        if (user.balance < product.price) {
-          return ctx.reply(t(lang, 'payment_insufficient', {
-            balance: user.balance.toLocaleString(),
-            required: product.price.toLocaleString(),
-          }));
+
+        let finalPrice = product.price;
+        const disc = ctx.session.discountCode
+          ? await validateDiscountCode(ctx.session.discountCode)
+          : null;
+        if (disc) finalPrice = priceAfterDiscount(product.price, disc.percent);
+
+        if (user.balance < finalPrice) {
+          return ctx.reply(
+            t(lang, 'payment_insufficient', {
+              balance: user.balance.toLocaleString(),
+              required: finalPrice.toLocaleString(),
+            }),
+          );
         }
+
         try {
-          const { renewOrder } = await import('../services/order.service.js');
-          await db.update(users).set({ balance: sql`${users.balance} - ${product.price}`, updatedAt: new Date() }).where(eq(users.id, user.id));
-          await db.insert(walletTransactions).values({ userId: user.id, amount: -product.price, type: 'purchase', description: `Renew order #${orderId}` });
-          try {
-            await renewOrder(orderId, product.durationDays);
-          } catch (renewErr) {
-            // Refund on renewal failure
-            await db.update(users).set({ balance: sql`${users.balance} + ${product.price}`, updatedAt: new Date() }).where(eq(users.id, user.id));
-            throw renewErr;
+          const result = await purchaseWithWallet(user.id, prodId, finalPrice, ctx.session.discountCode);
+          // Consume discount only after success
+          if (disc) {
+            const { sql } = await import('drizzle-orm');
+            const { discountCodes } = await import('../db/schema.js');
+            await db
+              .update(discountCodes)
+              .set({ usedCount: sql`${discountCodes.usedCount} + 1` })
+              .where(eq(discountCodes.id, disc.id));
           }
-          return ctx.reply(t(lang, 'service_renewed'), { reply_markup: mainMenuKeyboard(lang) });
+          ctx.session.selectedProduct = undefined;
+          ctx.session.discountCode = undefined;
+
+          return ctx.reply(
+            t(lang, 'config_created', {
+              username: result.email,
+              volume: formatVolume(product.volumeGb, lang),
+              expiry: result.order.expireAt?.toLocaleDateString(lang === 'fa' ? 'fa-IR' : 'en-US') || '-',
+              config: result.subLink,
+              sub: result.subLink,
+            }),
+            { reply_markup: mainMenuKeyboard(lang) },
+          );
         } catch {
           return ctx.reply(t(lang, 'error_generic'));
         }
       }
-      if (action === 'volume') {
-        return ctx.reply(t(lang, 'service_volume') + ' - ' + t(lang, 'support_contact'), {
+
+      // --- Pay with card ---
+      if (data === 'pay:card') {
+        const prodId = ctx.session.selectedProduct;
+        await answer(ctx);
+        if (!prodId) return ctx.reply(t(lang, 'error_generic'));
+        const product = await getProductById(prodId);
+        if (!product) return ctx.reply(t(lang, 'error_not_found'));
+
+        let finalPrice = product.price;
+        if (ctx.session.discountCode) {
+          const code = await validateDiscountCode(ctx.session.discountCode);
+          if (code) finalPrice = priceAfterDiscount(product.price, code.percent);
+        }
+
+        const payment = await createPendingPayment({
+          userId: user.id,
+          gateway: 'card',
+          amount: finalPrice,
+          purpose: 'product_purchase',
+          productId: prodId,
+          discountCode: ctx.session.discountCode,
+          description: `Product #${prodId}`,
+        });
+
+        ctx.session.step = 'awaiting_receipt';
+        ctx.session.pendingPayment = payment.id;
+
+        return ctx.reply(
+          t(lang, 'payment_card_info', {
+            amount: finalPrice.toLocaleString(),
+            card: config.CARD_NUMBER,
+            holder: config.CARD_HOLDER,
+          }),
+        );
+      }
+
+      // --- Zarinpal ---
+      if (data === 'pay:zarinpal') {
+        const prodId = ctx.session.selectedProduct;
+        await answer(ctx);
+        if (!prodId) return ctx.reply(t(lang, 'error_generic'));
+        const product = await getProductById(prodId);
+        if (!product) return ctx.reply(t(lang, 'error_not_found'));
+        if (!config.ZARINPAL_MERCHANT_ID) return ctx.reply(t(lang, 'error_generic'));
+
+        let finalPrice = product.price;
+        if (ctx.session.discountCode) {
+          const code = await validateDiscountCode(ctx.session.discountCode);
+          if (code) finalPrice = priceAfterDiscount(product.price, code.percent);
+        }
+
+        try {
+          const result = await zarinpalRequest({
+            amount: finalPrice,
+            userId: user.id,
+            description: `Product #${prodId}`,
+          });
+          if (!result.success || !result.paymentUrl) return ctx.reply(t(lang, 'error_generic'));
+
+          const payment = await createPendingPayment({
+            userId: user.id,
+            gateway: 'zarinpal',
+            amount: finalPrice,
+            purpose: 'product_purchase',
+            productId: prodId,
+            discountCode: ctx.session.discountCode,
+            description: `Product #${prodId}`,
+            authority: result.authority,
+            refId: result.authority,
+          });
+
+          ctx.session.pendingPayment = payment.id;
+          return ctx.reply(t(lang, 'payment_online_link'), {
+            reply_markup: {
+              inline_keyboard: [[{ text: t(lang, 'payment_pay_button'), url: result.paymentUrl }]],
+            },
+          });
+        } catch {
+          return ctx.reply(t(lang, 'error_generic'));
+        }
+      }
+
+      // --- NowPayments ---
+      if (data === 'pay:nowpayments') {
+        const prodId = ctx.session.selectedProduct;
+        await answer(ctx);
+        if (!prodId) return ctx.reply(t(lang, 'error_generic'));
+        const product = await getProductById(prodId);
+        if (!product) return ctx.reply(t(lang, 'error_not_found'));
+        if (!config.NOWPAYMENTS_API_KEY) return ctx.reply(t(lang, 'error_generic'));
+
+        let finalPrice = product.price;
+        if (ctx.session.discountCode) {
+          const code = await validateDiscountCode(ctx.session.discountCode);
+          if (code) finalPrice = priceAfterDiscount(product.price, code.percent);
+        }
+
+        try {
+          const result = await nowpaymentsRequest({
+            amount: finalPrice,
+            userId: user.id,
+            description: `Product #${prodId}`,
+          });
+          if (!result.success || !result.paymentUrl) return ctx.reply(t(lang, 'error_generic'));
+
+          await createPendingPayment({
+            userId: user.id,
+            gateway: 'nowpayments',
+            amount: finalPrice,
+            purpose: 'product_purchase',
+            productId: prodId,
+            discountCode: ctx.session.discountCode,
+            description: `Product #${prodId}`,
+            refId: result.refId,
+          });
+
+          return ctx.reply(t(lang, 'payment_online_link'), {
+            reply_markup: {
+              inline_keyboard: [[{ text: t(lang, 'payment_pay_button'), url: result.paymentUrl }]],
+            },
+          });
+        } catch {
+          return ctx.reply(t(lang, 'error_generic'));
+        }
+      }
+
+      // --- Service actions ---
+      if (data.startsWith('svc:')) {
+        const [, action, idStr] = data.split(':');
+        const orderId = parseInt(idStr, 10);
+        const order = await getOrderById(orderId);
+        await answer(ctx);
+        if (!order || order.userId !== user.id) return ctx.reply(t(lang, 'error_not_found'));
+
+        if (action === 'config' || action === 'sub') {
+          return ctx.reply(`🔗 ${order.subLink || order.configLink || 'N/A'}`);
+        }
+
+        if (action === 'renew') {
+          const product = await getProductById(order.productId);
+          if (!product) return ctx.reply(t(lang, 'error_not_found'));
+          if (user.balance < product.price) {
+            return ctx.reply(
+              t(lang, 'payment_insufficient', {
+                balance: user.balance.toLocaleString(),
+                required: product.price.toLocaleString(),
+              }),
+            );
+          }
+          try {
+            await renewOrderWithWallet(user.id, orderId, product.price, product.durationDays);
+            return ctx.reply(t(lang, 'service_renewed'), { reply_markup: mainMenuKeyboard(lang) });
+          } catch {
+            return ctx.reply(t(lang, 'error_generic'));
+          }
+        }
+
+        if (action === 'volume') {
+          const gb = 10;
+          const price = config.VOLUME_GB_PRICE * gb;
+          if (price <= 0) {
+            return ctx.reply(t(lang, 'service_volume') + ' - ' + t(lang, 'support_contact'), {
+              reply_markup: backToMenuKeyboard(lang),
+            });
+          }
+          if (user.balance < price) {
+            return ctx.reply(
+              t(lang, 'payment_insufficient', {
+                balance: user.balance.toLocaleString(),
+                required: price.toLocaleString(),
+              }),
+            );
+          }
+          try {
+            await addVolumeWithWallet(user.id, orderId, gb, price);
+            return ctx.reply(t(lang, 'service_renewed'), { reply_markup: mainMenuKeyboard(lang) });
+          } catch {
+            return ctx.reply(t(lang, 'error_generic'));
+          }
+        }
+      }
+
+      // --- Wallet ---
+      if (data === 'wallet:charge') {
+        ctx.session.step = 'awaiting_charge_amount';
+        await answer(ctx);
+        return ctx.reply(t(lang, 'wallet_charge_amount'));
+      }
+
+      if (data === 'wallet:history') {
+        await answer(ctx);
+        const txs = await db.query.walletTransactions.findMany({
+          where: eq(walletTransactions.userId, user.id),
+          orderBy: [desc(walletTransactions.createdAt)],
+          limit: 10,
+        });
+        if (txs.length === 0) {
+          return ctx.reply(t(lang, 'wallet_empty_history'), { reply_markup: backToMenuKeyboard(lang) });
+        }
+        let msg = '';
+        for (const tx of txs) {
+          const sign = tx.amount > 0 ? '+' : '';
+          msg += `${sign}${tx.amount.toLocaleString()} | ${tx.type} | ${tx.createdAt.toLocaleDateString()}\n`;
+        }
+        return ctx.reply(msg, { reply_markup: backToMenuKeyboard(lang) });
+      }
+
+      if (data === 'wallet:gift') {
+        ctx.session.step = 'awaiting_gift';
+        await answer(ctx);
+        return ctx.reply(t(lang, 'gift_enter'));
+      }
+
+      // --- Account ---
+      if (data === 'account:referral') {
+        await answer(ctx);
+        const stats = await getReferralStats(user.id);
+        const link = `https://t.me/${config.BOT_USERNAME}?start=${user.refCode}`;
+        return ctx.reply(
+          t(lang, 'account_referral', {
+            link,
+            count: stats.count,
+            earnings: stats.earnings.toLocaleString(),
+          }),
+          { reply_markup: backToMenuKeyboard(lang) },
+        );
+      }
+
+      if (data === 'account:language') {
+        await answer(ctx);
+        return ctx.reply(t(lang, 'account_language'), { reply_markup: languageKeyboard() });
+      }
+
+      if (data === 'support:faq') {
+        await answer(ctx);
+        return ctx.reply(t(lang, 'support_faq', { faq: '1. How to connect?\n2. How to renew?' }), {
           reply_markup: backToMenuKeyboard(lang),
         });
       }
-    }
 
-    // Wallet actions
-    if (data === 'wallet:charge') {
-      ctx.session.step = 'awaiting_charge_amount';
-      return ctx.reply(t(lang, 'wallet_charge_amount'));
-    }
-    if (data === 'wallet:history') {
-      const txs = await db.query.walletTransactions.findMany({
-        where: eq(walletTransactions.userId, user.id),
-        limit: 10,
-      });
-      if (txs.length === 0) return ctx.reply(t(lang, 'wallet_empty_history'), { reply_markup: backToMenuKeyboard(lang) });
-      let msg = '';
-      for (const tx of txs) {
-        const sign = tx.amount > 0 ? '+' : '';
-        msg += `${sign}${tx.amount.toLocaleString()} | ${tx.type} | ${tx.createdAt.toLocaleDateString()}\n`;
+      if (data === 'support:contact') {
+        ctx.session.step = 'awaiting_support_msg';
+        await answer(ctx);
+        return ctx.reply(t(lang, 'support_contact'));
       }
-      return ctx.reply(msg, { reply_markup: backToMenuKeyboard(lang) });
-    }
 
-    // Account actions
-    if (data === 'account:referral') {
-      const stats = await getReferralStats(user.id);
-      const link = `https://t.me/${config.BOT_USERNAME}?start=${user.refCode}`;
-      return ctx.reply(
-        t(lang, 'account_referral', {
-          link,
-          count: stats.count,
-          earnings: stats.earnings.toLocaleString(),
-        }),
-        { reply_markup: backToMenuKeyboard(lang) },
-      );
-    }
-    if (data === 'account:language') {
-      return ctx.reply(t(lang, 'account_language'), { reply_markup: languageKeyboard() });
-    }
+      // --- Trial ---
+      if (data === 'trial:confirm') {
+        await answer(ctx);
+        if (!config.TRIAL_ENABLED) return ctx.reply(t(lang, 'trial_disabled'));
 
-    // Support
-    if (data === 'support:faq') {
-      return ctx.reply(t(lang, 'support_faq', { faq: '1. How to connect?\n2. How to renew?' }), {
-        reply_markup: backToMenuKeyboard(lang),
-      });
-    }
-    if (data === 'support:contact') {
-      ctx.session.step = 'awaiting_support_msg';
-      return ctx.reply(t(lang, 'support_contact'));
-    }
+        const existingTrial = await db.query.trials.findFirst({ where: eq(trials.userId, user.id) });
+        if (existingTrial) return ctx.reply(t(lang, 'trial_used'));
 
-    // Trial
-    if (data === 'trial:confirm') {
-      if (!config.TRIAL_ENABLED) return ctx.reply(t(lang, 'trial_disabled'));
+        try {
+          const trialProduct = await db.query.products.findFirst({ where: eq(products.isActive, true) });
+          if (!trialProduct) return ctx.reply(t(lang, 'error_generic'));
 
-      // Check if already used
-      const existingTrial = await db.query.trials.findFirst({ where: eq(trials.userId, user.id) });
-      if (existingTrial) return ctx.reply(t(lang, 'trial_used'));
+          const result = await createOrder({
+            userId: user.id,
+            productId: trialProduct.id,
+            isTrial: true,
+            finalPrice: 0,
+          });
 
-      try {
-        // Find the first active product for trial
-        const trialProduct = await db.query.products.findFirst({ where: eq(products.isActive, true) });
-        if (!trialProduct) return ctx.reply(t(lang, 'error_generic'));
+          try {
+            await db.insert(trials).values({
+              userId: user.id,
+              orderId: result.order.id,
+              productId: trialProduct.id,
+              expireAt: new Date(Date.now() + config.TRIAL_DAYS * 24 * 60 * 60 * 1000),
+            });
+          } catch {
+            // Unique violation = already used (race)
+            return ctx.reply(t(lang, 'trial_used'));
+          }
 
-        const result = await createOrder({
-          userId: user.id,
-          productId: trialProduct.id,
-          isTrial: true,
-          finalPrice: 0,
-        });
-
-        await db.insert(trials).values({
-          userId: user.id,
-          orderId: result.order.id,
-          expireAt: new Date(Date.now() + config.TRIAL_DAYS * 24 * 60 * 60 * 1000),
-        });
-
-        return ctx.reply(t(lang, 'trial_created', {
-          days: config.TRIAL_DAYS,
-          volume: config.TRIAL_VOLUME_GB,
-          config: result.subLink,
-        }), { reply_markup: mainMenuKeyboard(lang) });
-      } catch {
-        return ctx.reply(t(lang, 'error_generic'));
+          return ctx.reply(
+            t(lang, 'trial_created', {
+              days: config.TRIAL_DAYS,
+              volume: config.TRIAL_VOLUME_GB,
+              config: result.subLink,
+            }),
+            { reply_markup: mainMenuKeyboard(lang) },
+          );
+        } catch {
+          return ctx.reply(t(lang, 'error_generic'));
+        }
       }
-    }
 
-    // Back to menu
-    if (data === 'menu:main') {
-      ctx.session.step = undefined;
-      return ctx.reply(t(lang, 'welcomeBack', { name: ctx.from.first_name || 'User' }), {
-        reply_markup: mainMenuKeyboard(lang),
-      });
-    }
+      if (data === 'menu:main') {
+        ctx.session.step = undefined;
+        await answer(ctx);
+        return ctx.reply(t(lang, 'welcomeBack', { name: ctx.from.first_name || 'User' }), {
+          reply_markup: mainMenuKeyboard(lang),
+        });
+      }
 
-    // Shop back
-    if (data === 'shop:back') {
-      const cats = await getActiveCategories();
-      return ctx.reply(t(lang, 'shop_select_category'), {
-        reply_markup: categoryKeyboard(cats, lang),
-      });
+      if (data === 'shop:back') {
+        await answer(ctx);
+        const cats = await getActiveCategories();
+        return ctx.reply(t(lang, 'shop_select_category'), {
+          reply_markup: categoryKeyboard(cats, lang),
+        });
+      }
+
+      await answer(ctx);
+    } catch (err) {
+      console.error('[BOT] callback error:', err);
+      await answer(ctx, t(lang, 'error_generic'), true);
     }
   });
 
-  // === Photo handler (receipt upload) ===
+  // === Photo (receipt) ===
   bot.on('message:photo', async (ctx) => {
     const user = await getUserByTelegramId(ctx.from?.id || 0);
     if (!user) return;
@@ -600,17 +722,17 @@ export function createBot() {
       ctx.session.pendingPayment = undefined;
 
       if (paymentId) {
-        // Save receipt file_id to payment
         const photo = ctx.message.photo[ctx.message.photo.length - 1];
         await db.update(payments).set({ receiptPhoto: photo.file_id }).where(eq(payments.id, paymentId));
 
-        // Forward to admins for approval
         for (const adminId of adminIds) {
           try {
             await ctx.api.sendPhoto(adminId, photo.file_id, {
               caption: `💳 Receipt from ${ctx.from.first_name} (@${ctx.from.username || user.telegramId})\nPayment #${paymentId}\nUse /approve_${paymentId} or /reject_${paymentId}`,
             });
-          } catch { /* admin may not have started the bot */ }
+          } catch {
+            /* */
+          }
         }
       }
 
@@ -620,71 +742,25 @@ export function createBot() {
     }
   });
 
-  // === Admin approval commands ===
+  // === Admin approve / reject ===
   bot.hears(/\/approve_(\d+)/, async (ctx) => {
     if (!adminIds.includes(ctx.from?.id || 0)) return;
-    const paymentId = parseInt(ctx.match[1]);
-    const payment = await db.query.payments.findFirst({ where: eq(payments.id, paymentId) });
-    if (!payment || payment.status !== 'pending') return ctx.reply('Payment not found or already processed.');
-
-    await db.update(payments).set({ status: 'confirmed', paidAt: new Date() }).where(eq(payments.id, paymentId));
-
-    const payUser = await db.query.users.findFirst({ where: eq(users.id, payment.userId) });
-
-    // Check if this is a product purchase or a wallet charge
-    const productMatch = payment.description?.match(/Product #(\d+)/);
-
-    if (productMatch) {
-      // Product purchase — create order and deliver config
-      const productId = parseInt(productMatch[1]);
-      try {
-        const result = await createOrder({
-          userId: payment.userId,
-          productId,
-          finalPrice: payment.amount,
-        });
-        // Notify user with config
-        if (payUser) {
-          await ctx.api.sendMessage(payUser.telegramId,
-            `${t('fa', 'payment_approved')}\n\n${result.subLink}`,
-          );
-        }
-      } catch (err) {
-        // If order creation fails, credit wallet as fallback
-        await db.update(users).set({ balance: sql`${users.balance} + ${payment.amount}`, updatedAt: new Date() }).where(eq(users.id, payment.userId));
-        if (payUser) await ctx.api.sendMessage(payUser.telegramId, t('fa', 'payment_approved'));
-      }
-    } else {
-      // Wallet charge — credit balance
-      await db.update(users).set({ balance: sql`${users.balance} + ${payment.amount}`, updatedAt: new Date() }).where(eq(users.id, payment.userId));
-      await db.insert(walletTransactions).values({
-        userId: payment.userId,
-        amount: payment.amount,
-        type: 'charge',
-        description: `Card payment #${paymentId} approved`,
-      });
-      if (payUser) {
-        try { await ctx.api.sendMessage(payUser.telegramId, t('fa', 'payment_approved')); } catch { /* */ }
-      }
-    }
-
+    const paymentId = parseInt(ctx.match[1], 10);
+    const result = await confirmAndFulfillPayment(paymentId, true);
+    if (!result.ok) return ctx.reply('Payment not found or already processed.');
     return ctx.reply(`✅ Payment #${paymentId} approved.`);
   });
 
   bot.hears(/\/reject_(\d+)/, async (ctx) => {
     if (!adminIds.includes(ctx.from?.id || 0)) return;
-    const paymentId = parseInt(ctx.match[1]);
-    const payment = await db.query.payments.findFirst({ where: eq(payments.id, paymentId) });
-    if (!payment || payment.status !== 'pending') return ctx.reply('Payment not found or already processed.');
-
-    await db.update(payments).set({ status: 'rejected' }).where(eq(payments.id, paymentId));
-
-    try {
-      const payUser = await db.query.users.findFirst({ where: eq(users.id, payment.userId) });
-      if (payUser) await ctx.api.sendMessage(payUser.telegramId, t('fa', 'payment_rejected'));
-    } catch { /* */ }
-
+    const paymentId = parseInt(ctx.match[1], 10);
+    const result = await rejectPaymentAndNotify(paymentId);
+    if (!result.ok) return ctx.reply('Payment not found or already processed.');
     return ctx.reply(`❌ Payment #${paymentId} rejected.`);
+  });
+
+  bot.catch((err) => {
+    console.error('[BOT] Unhandled error:', err);
   });
 
   return bot;

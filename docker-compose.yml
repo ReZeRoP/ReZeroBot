@@ -7,8 +7,9 @@ services:
       POSTGRES_DB: ${DB_NAME:-sanaei_bot}
       POSTGRES_USER: ${DB_USER:-sanaei}
       POSTGRES_PASSWORD: ${DB_PASS:-sanaei_secret}
+    # Do not publish DB to the public internet by default
     ports:
-      - "${DB_PORT:-5432}:5432"
+      - "127.0.0.1:${DB_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -22,7 +23,7 @@ services:
     container_name: sanaei-bot-redis
     restart: unless-stopped
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -30,6 +31,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    command: ["redis-server", "--appendonly", "yes"]
 
   bot:
     build:
@@ -46,11 +48,19 @@ services:
       - .env
     ports:
       - "${BOT_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
 
   miniapp:
     build:
       context: .
       dockerfile: miniapp/Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-/api}
     container_name: sanaei-miniapp
     restart: unless-stopped
     ports:
@@ -60,6 +70,8 @@ services:
     build:
       context: .
       dockerfile: admin/Dockerfile
+      args:
+        VITE_API_URL: ${VITE_ADMIN_API_URL:-/api/admin}
     container_name: sanaei-admin
     restart: unless-stopped
     ports:

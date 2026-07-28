@@ -18,8 +18,7 @@ export async function getOrCreateUser(info: TelegramUserInfo, refCode?: string) 
   });
 
   if (existing) {
-    // Update user info
-    await db
+    const [updated] = await db
       .update(users)
       .set({
         username: info.username || existing.username,
@@ -27,12 +26,12 @@ export async function getOrCreateUser(info: TelegramUserInfo, refCode?: string) 
         lastName: info.lastName || existing.lastName,
         updatedAt: new Date(),
       })
-      .where(eq(users.id, existing.id));
+      .where(eq(users.id, existing.id))
+      .returning();
 
-    return { user: existing, isNew: false };
+    return { user: updated || existing, isNew: false };
   }
 
-  // Create new user
   const newRefCode = nanoid(8);
   let referredBy: number | null = null;
 
@@ -61,33 +60,35 @@ export async function getOrCreateUser(info: TelegramUserInfo, refCode?: string) 
       })
       .returning();
   } catch {
-    // Concurrent insert — user already exists, fetch and return
     const raced = await db.query.users.findFirst({
       where: eq(users.telegramId, info.telegramId),
     });
-    return { user: raced!, isNew: false };
+    if (!raced) throw new Error('Failed to create user');
+    return { user: raced, isNew: false };
   }
 
-  // Process referral reward
   if (referredBy && config.REFERRAL_ENABLED) {
-    await db.insert(referrals).values({
-      referrerId: referredBy,
-      referredId: newUser.id,
-      rewardAmount: config.REFERRAL_REWARD,
-    });
+    try {
+      await db.insert(referrals).values({
+        referrerId: referredBy,
+        referredId: newUser.id,
+        rewardAmount: config.REFERRAL_REWARD,
+      });
 
-    // Credit referrer atomically (increment, not overwrite)
-    await db
-      .update(users)
-      .set({ balance: sql`${users.balance} + ${config.REFERRAL_REWARD}`, updatedAt: new Date() })
-      .where(eq(users.id, referredBy));
+      await db
+        .update(users)
+        .set({ balance: sql`${users.balance} + ${config.REFERRAL_REWARD}`, updatedAt: new Date() })
+        .where(eq(users.id, referredBy));
 
-    await db.insert(walletTransactions).values({
-      userId: referredBy,
-      amount: config.REFERRAL_REWARD,
-      type: 'referral',
-      description: `Referral reward: ${info.firstName || info.telegramId}`,
-    });
+      await db.insert(walletTransactions).values({
+        userId: referredBy,
+        amount: config.REFERRAL_REWARD,
+        type: 'referral',
+        description: `Referral reward: ${info.firstName || info.telegramId}`,
+      });
+    } catch (err) {
+      console.error('[USER] Referral reward failed:', err);
+    }
   }
 
   return { user: newUser, isNew: true };
@@ -106,7 +107,12 @@ export async function getUserById(id: number) {
 }
 
 export async function updateUserLanguage(userId: number, language: Language) {
-  await db.update(users).set({ language, updatedAt: new Date() }).where(eq(users.id, userId));
+  const [updated] = await db
+    .update(users)
+    .set({ language, updatedAt: new Date() })
+    .where(eq(users.id, userId))
+    .returning();
+  return updated;
 }
 
 export async function updateUserBalance(userId: number, amount: number) {

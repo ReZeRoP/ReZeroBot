@@ -1,67 +1,132 @@
-import { Plus, Tag, Gift, Trophy } from 'lucide-react';
+import { useState } from 'react';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { Plus, Tag, Gift } from 'lucide-react';
+import { toast } from 'sonner';
+import { adminApi } from '../api/client';
 
 export function Marketing() {
+  const queryClient = useQueryClient();
+  const { data: discounts } = useQuery({
+    queryKey: ['admin-discounts'],
+    queryFn: adminApi.discounts,
+  });
+  const { data: gifts } = useQuery({
+    queryKey: ['admin-gifts'],
+    queryFn: adminApi.gifts,
+  });
+
+  const [disc, setDisc] = useState({ code: '', percent: 10, maxUses: 0 });
+  const [giftForm, setGiftForm] = useState({ count: 5, amount: 10000 });
+
+  const createDisc = useMutation({
+    mutationFn: () => adminApi.createDiscount(disc),
+    onSuccess: () => {
+      toast.success('کد تخفیف ساخته شد');
+      queryClient.invalidateQueries({ queryKey: ['admin-discounts'] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const genGifts = useMutation({
+    mutationFn: async () => {
+      const list = await adminApi.generateGifts(giftForm.count, giftForm.amount);
+      return list as any[];
+    },
+    onSuccess: (list) => {
+      toast.success(`${list.length} کد هدیه ساخته شد`);
+      queryClient.invalidateQueries({ queryKey: ['admin-gifts'] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-bold text-gray-900">بازاریابی</h1>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        {/* Discount Codes */}
-        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
-          <div className="flex items-center gap-2 mb-4">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5 space-y-3">
+          <div className="flex items-center gap-2 mb-2">
             <Tag size={18} className="text-blue-500" />
             <h3 className="font-bold text-gray-900">کد تخفیف</h3>
           </div>
-          <p className="text-sm text-gray-500 mb-4">۳ کد فعال</p>
-          <button className="w-full flex items-center justify-center gap-2 py-2 bg-blue-50 text-blue-600 rounded-lg text-sm font-medium hover:bg-blue-100">
+          <input
+            placeholder="CODE"
+            value={disc.code}
+            onChange={(e) => setDisc({ ...disc, code: e.target.value })}
+            className="w-full border rounded-lg px-3 py-2 text-sm"
+            dir="ltr"
+          />
+          <div className="flex gap-2">
+            <input
+              type="number"
+              value={disc.percent}
+              onChange={(e) => setDisc({ ...disc, percent: Number(e.target.value) })}
+              className="w-full border rounded-lg px-3 py-2 text-sm"
+              dir="ltr"
+            />
+            <input
+              type="number"
+              value={disc.maxUses}
+              onChange={(e) => setDisc({ ...disc, maxUses: Number(e.target.value) })}
+              className="w-full border rounded-lg px-3 py-2 text-sm"
+              dir="ltr"
+            />
+          </div>
+          <button
+            onClick={() => createDisc.mutate()}
+            className="w-full flex items-center justify-center gap-2 py-2 bg-blue-50 text-blue-600 rounded-lg text-sm font-medium"
+          >
             <Plus size={14} />
-            ساخت کد جدید
+            ساخت
           </button>
+          <ul className="text-xs text-gray-600 space-y-1 max-h-40 overflow-auto">
+            {(discounts || []).map((d: any) => (
+              <li key={d.id}>
+                {d.code} — {d.percent}% ({d.usedCount}/{d.maxUses || '∞'})
+              </li>
+            ))}
+          </ul>
         </div>
 
-        {/* Gift Codes */}
-        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
-          <div className="flex items-center gap-2 mb-4">
+        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5 space-y-3">
+          <div className="flex items-center gap-2 mb-2">
             <Gift size={18} className="text-orange-500" />
             <h3 className="font-bold text-gray-900">کد هدیه</h3>
           </div>
-          <p className="text-sm text-gray-500 mb-4">۱۰ کد استفاده نشده</p>
-          <button className="w-full flex items-center justify-center gap-2 py-2 bg-orange-50 text-orange-600 rounded-lg text-sm font-medium hover:bg-orange-100">
+          <div className="flex gap-2">
+            <input
+              type="number"
+              value={giftForm.count}
+              onChange={(e) => setGiftForm({ ...giftForm, count: Number(e.target.value) })}
+              className="w-full border rounded-lg px-3 py-2 text-sm"
+              dir="ltr"
+            />
+            <input
+              type="number"
+              value={giftForm.amount}
+              onChange={(e) => setGiftForm({ ...giftForm, amount: Number(e.target.value) })}
+              className="w-full border rounded-lg px-3 py-2 text-sm"
+              dir="ltr"
+            />
+          </div>
+          <button
+            onClick={() => genGifts.mutate()}
+            className="w-full flex items-center justify-center gap-2 py-2 bg-orange-50 text-orange-600 rounded-lg text-sm font-medium"
+          >
             <Plus size={14} />
-            تولید کد هدیه
+            تولید
           </button>
+          <ul className="text-xs text-gray-600 space-y-1 max-h-40 overflow-auto" dir="ltr">
+            {(gifts || [])
+              .filter((g: any) => !g.isUsed)
+              .slice(0, 20)
+              .map((g: any) => (
+                <li key={g.id}>
+                  {g.code} — {g.amount}
+                </li>
+              ))}
+          </ul>
         </div>
-
-        {/* Lottery */}
-        <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
-          <div className="flex items-center gap-2 mb-4">
-            <Trophy size={18} className="text-yellow-500" />
-            <h3 className="font-bold text-gray-900">قرعه‌کشی</h3>
-          </div>
-          <p className="text-sm text-gray-500 mb-4">بدون قرعه‌کشی فعال</p>
-          <button className="w-full flex items-center justify-center gap-2 py-2 bg-yellow-50 text-yellow-600 rounded-lg text-sm font-medium hover:bg-yellow-100">
-            <Plus size={14} />
-            ایجاد قرعه‌کشی
-          </button>
-        </div>
-      </div>
-
-      {/* Referral Settings */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-5">
-        <h3 className="font-bold text-gray-900 mb-4">تنظیمات معرفی</h3>
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <label className="text-sm text-gray-500 block mb-1">پاداش معرفی (تومان)</label>
-            <input type="number" defaultValue={10000} className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm" />
-          </div>
-          <div>
-            <label className="text-sm text-gray-500 block mb-1">کش‌بک خرید (%)</label>
-            <input type="number" defaultValue={5} className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm" />
-          </div>
-        </div>
-        <button className="mt-4 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700">
-          ذخیره
-        </button>
       </div>
     </div>
   );
