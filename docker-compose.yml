@@ -46,8 +46,9 @@ services:
         condition: service_healthy
     env_file:
       - .env
+    # Bind localhost only — Caddy (or another reverse proxy) should expose HTTPS
     ports:
-      - "${BOT_PORT:-3000}:3000"
+      - "127.0.0.1:${BOT_PORT:-3000}:3000"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
       interval: 30s
@@ -64,7 +65,7 @@ services:
     container_name: sanaei-miniapp
     restart: unless-stopped
     ports:
-      - "${MINIAPP_PORT:-8080}:80"
+      - "127.0.0.1:${MINIAPP_PORT:-8080}:80"
 
   admin:
     build:
@@ -75,7 +76,7 @@ services:
     container_name: sanaei-admin
     restart: unless-stopped
     ports:
-      - "${ADMIN_PORT:-8081}:80"
+      - "127.0.0.1:${ADMIN_PORT:-8081}:80"
 
 volumes:
   postgres_data:

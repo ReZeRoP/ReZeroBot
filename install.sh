@@ -163,6 +163,31 @@ if ! git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree &>/dev/null; then
   log "Git repository initialized (git pull available for future updates)"
 fi
 
+# --- Pick free host ports before writing .env ---
+pick_free_port() {
+  local preferred="$1"
+  local p="$preferred"
+  for _ in $(seq 1 40); do
+    if ! ss -tlnp 2>/dev/null | grep -qE ":${p}\\b"; then
+      echo "$p"
+      return 0
+    fi
+    p=$((p + 1))
+  done
+  echo "$preferred"
+}
+
+MINIAPP_PORT=$(pick_free_port 8080)
+ADMIN_PORT=$(pick_free_port 8081)
+if [[ "$MINIAPP_PORT" != "8080" ]]; then
+  warn "Port 8080 busy — miniapp will use host port ${MINIAPP_PORT}"
+fi
+if [[ "$ADMIN_PORT" != "8081" ]]; then
+  warn "Port 8081 busy — admin will use host port ${ADMIN_PORT}"
+fi
+
+ADMIN_PASSWORD=$(openssl rand -hex 12)
+
 # --- Generate .env ---
 info "Generating .env configuration..."
 cat > "$PROJECT_DIR/.env" <<EOF
@@ -182,10 +207,12 @@ REDIS_PORT=6379
 REDIS_URL=redis://redis:6379
 
 BOT_PORT=3000
-MINIAPP_PORT=8080
-ADMIN_PORT=8081
+MINIAPP_PORT=${MINIAPP_PORT}
+ADMIN_PORT=${ADMIN_PORT}
 WEBHOOK_PATH=/webhook
 USE_POLLING=true
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=${ADMIN_PASSWORD}
 
 PANEL_URL=${PANEL_URL}
 PANEL_API_KEY=${PANEL_API_KEY}
@@ -214,42 +241,64 @@ TRIAL_DAYS=1
 TRIAL_VOLUME_GB=1
 REFERRAL_ENABLED=true
 REFERRAL_REWARD=10000
-LOTTERY_ENABLED=true
+LOTTERY_ENABLED=false
 PHONE_VERIFY_ENABLED=false
+VOLUME_GB_PRICE=5000
 EOF
 
-log "Environment configured"
+log "Environment configured (miniapp :${MINIAPP_PORT}, admin :${ADMIN_PORT})"
 
 # --- Caddy reverse proxy (auto HTTPS) ---
 info "Setting up Caddy reverse proxy with automatic HTTPS..."
 
+# Stop common conflicting web servers so Caddy can bind 80/443
+for svc in nginx apache2 httpd; do
+  if systemctl is-active --quiet "$svc" 2>/dev/null; then
+    warn "Stopping ${svc} (conflicts with Caddy on ports 80/443)..."
+    systemctl stop "$svc" || true
+    systemctl disable "$svc" || true
+  fi
+done
+
 mkdir -p /etc/caddy
+
+# Backup existing Caddyfile
+if [[ -f /etc/caddy/Caddyfile ]]; then
+  cp /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%s)" || true
+fi
 
 cat > /etc/caddy/Caddyfile <<EOF
 ${DOMAIN} {
-    # Bot API + Webhook
+    encode gzip
+
     handle /api/* {
-        reverse_proxy localhost:3000
+        reverse_proxy 127.0.0.1:3000
     }
     handle /webhook {
-        reverse_proxy localhost:3000
+        reverse_proxy 127.0.0.1:3000
+    }
+    handle /health {
+        reverse_proxy 127.0.0.1:3000
     }
 
-    # Mini App
     handle /app/* {
         uri strip_prefix /app
-        reverse_proxy localhost:8080
+        reverse_proxy 127.0.0.1:${MINIAPP_PORT}
+    }
+    handle /app {
+        redir /app/ permanent
     }
 
-    # Admin Panel
     handle /admin/* {
         uri strip_prefix /admin
-        reverse_proxy localhost:8081
+        reverse_proxy 127.0.0.1:${ADMIN_PORT}
+    }
+    handle /admin {
+        redir /admin/ permanent
     }
 
-    # Default: redirect to mini app
     handle {
-        redir /app permanent
+        redir /app/ permanent
     }
 }
 EOF
@@ -266,19 +315,29 @@ else
   log "Caddy installed"
 fi
 
+# Validate config before restart
+if caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
+  log "Caddyfile is valid"
+else
+  warn "Caddyfile validation reported issues — check /etc/caddy/Caddyfile"
+fi
+
 systemctl enable caddy
 if systemctl restart caddy; then
   log "Caddy configured for ${DOMAIN}"
 else
   warn "Caddy failed to start. Check: journalctl -xeu caddy.service"
-  warn "Make sure DNS for ${DOMAIN} points to this server and ports 80/443 are free."
-  warn "You can fix and restart later: systemctl restart caddy"
+  warn "Ports 80/443 in use? Run: ss -tlnp | grep -E ':80|:443'"
+  warn "DNS for ${DOMAIN} must point to this server."
+  warn "Containers will still start; fix Caddy then: systemctl restart caddy"
 fi
 
 # --- Build and start containers ---
 info "Building containers (this may take a few minutes)..."
 cd "$PROJECT_DIR"
 docker compose down --remove-orphans 2>/dev/null || true
+# Free leftover containers that might hold ports
+docker rm -f sanaei-miniapp sanaei-admin sanaei-bot 2>/dev/null || true
 docker compose build --no-cache
 docker compose up -d
 
@@ -333,17 +392,20 @@ echo "  Bot API:      https://${DOMAIN}/api"
 echo "  Mini App:     https://${DOMAIN}/app"
 echo "  Admin Panel:  https://${DOMAIN}/admin"
 echo "  Webhook:      https://${DOMAIN}/webhook"
+echo "  Health:       https://${DOMAIN}/health"
 echo ""
 echo "  Database:     ${DB_NAME} (user: ${DB_USER})"
 echo "  DB Password:  ${DB_PASS}"
+echo "  Admin login:  admin / ${ADMIN_PASSWORD:-<see .env ADMIN_PASSWORD>}"
 echo ""
 echo "  Project Dir:  ${PROJECT_DIR}"
+echo "  Local ports:  bot=3000 miniapp=${MINIAPP_PORT:-8080} admin=${ADMIN_PORT:-8081} (127.0.0.1 only)"
 echo ""
 echo "  Commands:"
-echo "    docker compose logs -f     # View logs"
-echo "    docker compose restart     # Restart all"
-echo "    docker compose down        # Stop all"
-echo "    ./install.sh --update      # Update to latest code"
+echo "    cd ${PROJECT_DIR} && docker compose logs -f"
+echo "    docker compose restart"
+echo "    docker compose down"
+echo "    ./install.sh --update"
 echo ""
-echo -e "${YELLOW}  ⚠ Save your DB password: ${DB_PASS}${NC}"
+echo -e "${YELLOW}  ⚠ Save DB password and admin password now${NC}"
 echo "═══════════════════════════════════════════"
