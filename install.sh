@@ -315,6 +315,19 @@ else
   log "Caddy installed"
 fi
 
+# Ensure system user/group exist (status=217/USER if missing)
+if ! id caddy &>/dev/null; then
+  warn "System user 'caddy' missing — creating..."
+  groupadd --system caddy 2>/dev/null || true
+  useradd --system --gid caddy --create-home --home-dir /var/lib/caddy \
+    --shell /usr/sbin/nologin --comment "Caddy web server" caddy 2>/dev/null || true
+fi
+mkdir -p /var/lib/caddy /var/log/caddy /etc/caddy
+chown -R caddy:caddy /var/lib/caddy /var/log/caddy 2>/dev/null || true
+# Caddy needs to read the config as the caddy user
+chown root:caddy /etc/caddy/Caddyfile 2>/dev/null || true
+chmod 644 /etc/caddy/Caddyfile 2>/dev/null || true
+
 # Validate config before restart
 if caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
   log "Caddyfile is valid"
@@ -322,11 +335,13 @@ else
   warn "Caddyfile validation reported issues — check /etc/caddy/Caddyfile"
 fi
 
+systemctl daemon-reload
 systemctl enable caddy
 if systemctl restart caddy; then
   log "Caddy configured for ${DOMAIN}"
 else
   warn "Caddy failed to start. Check: journalctl -xeu caddy.service"
+  warn "If status=217/USER: id caddy; create user as above; systemctl restart caddy"
   warn "Ports 80/443 in use? Run: ss -tlnp | grep -E ':80|:443'"
   warn "DNS for ${DOMAIN} must point to this server."
   warn "Containers will still start; fix Caddy then: systemctl restart caddy"
